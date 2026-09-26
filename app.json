@@ -1,25 +1,28 @@
 {
   "expo": {
-    "name": "InstaPulseReal",
-    "slug": "InstaPulseReal",
+    "name": "InstaPulse",
+    "slug": "instapulse-real",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
-    "ios": {
-      "supportsTablet": true
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#090A0F",
+    "icon": "./assets/mipmap-xxxhdpi/ic_launcher.png",
+    "splash": {
+      "image": "./assets/mipmap-xxxhdpi/ic_launcher.png",
+      "backgroundColor": "#090A0F",
+      "resizeMode": "contain"
     },
     "android": {
+      "package": "com.nima.instapulse",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
-      },
-      "predictiveBackGestureEnabled": false
+        "foregroundImage": "./assets/mipmap-xxxhdpi/ic_launcher_foreground.png",
+        "backgroundColor": "#090A0F"
+      }
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
+    "extra": {
+      "eas": {
+        "projectId": "e0a9eb1e-b1fc-45d5-ae35-3bf8ad45eb85"
+      }
     }
   }
 }

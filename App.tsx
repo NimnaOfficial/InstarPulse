@@ -1,20 +1,378 @@
-import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, Text, View } from 'react-native';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import {
+    Text,
+  View,
+  TouchableOpacity,
+  Modal,
+  Alert,
+  LayoutAnimation,
+  StatusBar,
+  LogBox
+} from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { InstaPulseDashboard } from './InstaPulseDashboard';
+import { InstaActionExecutor, ActionQueueItem } from './InstaActionExecutor';
+import { IGUser } from './types';
+
+LogBox.ignoreLogs(['SafeAreaView has been deprecated']);
+
+const STORAGE_KEYS = {
+  RECENT_ACTIVITY: '@instapulse_recent_activity_v1',
+  LAST_FOLLOWERS: '@instapulse_last_followers_v1',
+  LAST_FOLLOWING: '@instapulse_last_following_v1',
+  WHITELIST: '@instapulse_whitelist_v1',
+  
+  ACTION_LOG: '@instapulse_action_log_v1',
+};
+
+const INJECTED_IG_BRIDGE = `
+(function() {
+  if (window.__INSTAPULSE_BRIDGE_ACTIVE) return;
+  window.__INSTAPULSE_BRIDGE_ACTIVE = true;
+
+  const IG_APP_ID = '936619743392459';
+
+  function getCookie(name) {
+    const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return match ? decodeURIComponent(match[2]) : null;
+  }
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function checkAuthStatus() {
+    const dsUserId = getCookie('ds_user_id');
+    const csrfToken = getCookie('csrftoken');
+    window.ReactNativeWebView.postMessage(JSON.stringify({
+      type: 'AUTH_STATUS',
+      isLoggedIn: Boolean(dsUserId && csrfToken),
+      dsUserId: dsUserId || null
+    }));
+  }
+
+  checkAuthStatus();
+  setInterval(checkAuthStatus, 2000);
+
+  async function fetchGraphEdge(userId, edgeType) {
+    let allUsers = [];
+    let nextMaxId = '';
+    let hasNext = true;
+
+    while (hasNext) {
+      const url = 'https://www.instagram.com/api/v1/friendships/' + userId + '/' + edgeType + '/?count=100' + (nextMaxId ? '&max_id=' + encodeURIComponent(nextMaxId) : '');
+      const res = await fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'x-ig-app-id': IG_APP_ID,
+          'x-csrftoken': getCookie('csrftoken') || '',
+          'x-requested-with': 'XMLHttpRequest'
+        }
+      });
+
+      if (!res.ok) {
+        throw new Error('Instagram HTTP ' + res.status + ' while fetching ' + edgeType);
+      }
+
+      const data = await res.json();
+      const batch = (data.users || []).map(u => ({
+        pk: String(u.pk || u.id),
+        username: String(u.username || '').toLowerCase(),
+        fullName: String(u.full_name || ''),
+        profilePicUrl: String(u.profile_pic_url || ''),
+        isVerified: Boolean(u.is_verified),
+        isPrivate: Boolean(u.is_private)
+      }));
+
+      allUsers = allUsers.concat(batch);
+
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'SYNC_PROGRESS',
+        edgeType: edgeType,
+        count: allUsers.length
+      }));
+
+      if (data.next_max_id && data.big_list !== false) {
+        nextMaxId = data.next_max_id;
+        await sleep(350 + Math.random() * 300);
+      } else {
+        hasNext = false;
+      }
+    }
+    return allUsers;
+  }
+
+  window.runRealInstagramSync = async function() {
+    try {
+      const myId = getCookie('ds_user_id');
+      if (!myId) {
+        window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'AUTH_REQUIRED' }));
+        return;
+      }
+      const [followers, following] = await Promise.all([
+        fetchGraphEdge(myId, 'followers'),
+        fetchGraphEdge(myId, 'following')
+      ]);
+
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'SYNC_SUCCESS',
+        followers: followers,
+        following: following
+      }));
+    } catch (err) {
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'SYNC_ERROR',
+        message: err.message || 'Failed to sync graph'
+      }));
+    }
+  };
+})();
+true;
+`;
 
 export default function App() {
+  const webViewRef = useRef<WebView>(null);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [showLoginModal, setShowLoginModal] = useState(false);
+
+  const [followers, setFollowers] = useState<IGUser[]>([]);
+  const [following, setFollowing] = useState<IGUser[]>([]);
+  const [whitelistPks, setWhitelistPks] = useState<Set<string>>(new Set());
+  
+  const [recentActivity, setRecentActivity] = useState<IGUser[]>([]);
+  
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncProgress, setSyncProgress] = useState({ followers: 0, following: 0 });
+  const [actionTimestamps, setActionTimestamps] = useState<number[]>([]);
+
+  // Queue Executor State
+  const [executorVisible, setExecutorVisible] = useState(false);
+  const [actionQueue, setActionQueue] = useState<ActionQueueItem[]>([]);
+  const [executorMode, setExecutorMode] = useState<'ASSIST' | 'AUTO_QUEUE'>('AUTO_QUEUE');
+  const [busyPk, setBusyPk] = useState<string | null>(null);
+
+  // Load from AsyncStorage
+  useEffect(() => {
+    (async () => {
+      try {
+        const [recentRaw, folRaw, fingRaw, logRaw, whitelistRaw] = await Promise.all([
+          AsyncStorage.getItem(STORAGE_KEYS.RECENT_ACTIVITY),
+          AsyncStorage.getItem(STORAGE_KEYS.LAST_FOLLOWERS),
+          AsyncStorage.getItem(STORAGE_KEYS.LAST_FOLLOWING),
+          AsyncStorage.getItem(STORAGE_KEYS.ACTION_LOG),
+          AsyncStorage.getItem(STORAGE_KEYS.WHITELIST),
+          
+        ]);
+        if (recentRaw) setRecentActivity(JSON.parse(recentRaw));
+        if (folRaw) setFollowers(JSON.parse(folRaw));
+        if (fingRaw) setFollowing(JSON.parse(fingRaw));
+        if (logRaw) setActionTimestamps(JSON.parse(logRaw));
+        if (whitelistRaw) setWhitelistPks(new Set(JSON.parse(whitelistRaw)));
+        
+      } catch (e) {
+        console.warn('Cache load error:', e);
+      }
+    })();
+  }, []);
+
+  const handleWebViewMessage = async (event: WebViewMessageEvent) => {
+    try {
+      const msg = JSON.parse(event.nativeEvent.data);
+
+      if (msg.type === 'AUTH_STATUS') {
+        setIsLoggedIn(msg.isLoggedIn);
+        if (msg.isLoggedIn && showLoginModal) {
+          setShowLoginModal(false);
+          startLiveAccountSync();
+        }
+      } else if (msg.type === 'SYNC_PROGRESS') {
+        setSyncProgress((prev) => ({
+          ...prev,
+          [msg.edgeType]: msg.count,
+        }));
+      } else if (msg.type === 'SYNC_SUCCESS') {
+        setIsSyncing(false);
+                setFollowers(msg.followers);
+        setFollowing(msg.following);
+        await AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWERS, JSON.stringify(msg.followers));
+        await AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(msg.following));
+      } else if (msg.type === 'SYNC_ERROR') {
+        setIsSyncing(false);
+        Alert.alert('Sync Alert', msg.message);
+      }
+    } catch (e) {
+      console.warn('Bridge msg parse error', e);
+    }
+  };
+
+  
+  const handleLogout = () => {
+    setFollowers([]);
+    setFollowing([]);
+    setRecentActivity([]);
+    setIsLoggedIn(false);
+    AsyncStorage.clear();
+    if (webViewRef.current) {
+      webViewRef.current.injectJavaScript(`
+        document.cookie.split(";").forEach(function(c) { 
+          document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/"); 
+        });
+        window.location.href = 'https://www.instagram.com/accounts/logout/';
+      `);
+    }
+  };
+
+  const startLiveAccountSync = () => {
+    if (!isLoggedIn) {
+      setShowLoginModal(true);
+      return;
+    }
+    setSyncProgress({ followers: 0, following: 0 });
+    setIsSyncing(true);
+    webViewRef.current?.injectJavaScript('window.runRealInstagramSync(); true;');
+  };
+
+  const handleStartBatchQueue = useCallback((queue: ActionQueueItem[]) => {
+    if (queue.length === 0) return;
+    setActionQueue(queue);
+    setExecutorVisible(true);
+  }, []);
+
+  const handleToggleWhitelist = useCallback(async (pk: string) => {
+    setWhitelistPks((prev) => {
+      const next = new Set(prev);
+      if (next.has(pk)) next.delete(pk);
+      else next.add(pk);
+      AsyncStorage.setItem(STORAGE_KEYS.WHITELIST, JSON.stringify(Array.from(next)));
+      return next;
+    });
+  }, []);
+
+  const handleInspectProfile = useCallback((username: string) => {
+    setActionQueue([{ username, action: 'FOLLOW' }]);
+    setExecutorMode('ASSIST');
+    setExecutorVisible(true);
+  }, []);
+
   return (
-    <View style={styles.container}>
-      <Text>Open up App.tsx to start working on your app!</Text>
-      <StatusBar style="auto" />
-    </View>
+    <SafeAreaProvider>
+      <View style={{ flex: 1, backgroundColor: '#090A0F' }}>
+        <StatusBar barStyle="light-content" backgroundColor="#090A0F" />
+        
+        {/* HIDDEN BACKGROUND WEBVIEW FOR FETCHING FOLLOWERS DATA */}
+        <View style={{ height: 0, width: 0, overflow: 'hidden' }}>
+          <WebView
+            ref={webViewRef}
+            source={{ uri: 'https://www.instagram.com/' }}
+            injectedJavaScript={INJECTED_IG_BRIDGE}
+            onMessage={handleWebViewMessage}
+            sharedCookiesEnabled={true}
+            thirdPartyCookiesEnabled={true}
+            domStorageEnabled={true}
+            javaScriptEnabled={true}
+          />
+        </View>
+
+        <InstaPulseDashboard
+          isLoggedIn={isLoggedIn}
+          isSyncing={isSyncing}
+          syncProgress={syncProgress}
+          followers={followers}
+          following={following}
+          recentActivity={recentActivity}
+          onOpenLoginModal={() => setShowLoginModal(true)}
+          onStartLiveSync={startLiveAccountSync}
+          onLogout={handleLogout}
+          onStartBatchQueue={handleStartBatchQueue}
+          onInspectProfile={handleInspectProfile}
+          actionTimestamps={actionTimestamps}
+          busyPk={busyPk}
+          whitelistPks={whitelistPks}
+          
+          onToggleWhitelist={handleToggleWhitelist}
+        />
+
+        <InstaActionExecutor
+          visible={executorVisible}
+          queue={actionQueue}
+          mode={executorMode}
+          onClose={() => {
+            setExecutorVisible(false);
+            setExecutorMode('AUTO_QUEUE');
+            setBusyPk(null);
+          }}
+          onActionStart={(pk) => {
+            setBusyPk(pk);
+          }}
+          onActionComplete={(item, status) => {
+            if (status === 'ERROR') {
+              Alert.alert('Action Failed', `Could not ${item.action.toLowerCase()} @${item.username}. Instagram may have rejected it or the button wasn't found.`);
+              return;
+            }
+
+            LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+            const updatedLogs = [...actionTimestamps, Date.now()];
+            setActionTimestamps(updatedLogs);
+            AsyncStorage.setItem(STORAGE_KEYS.ACTION_LOG, JSON.stringify(updatedLogs));
+
+            let actionType: 'unfollowed' | 'followed' | 'skipped_unavailable' = item.action === 'UNFOLLOW' ? 'unfollowed' : 'followed';
+            if (status === 'SKIPPED_UNAVAILABLE') {
+              actionType = 'skipped_unavailable';
+            }
+
+            const actionTarget = followers.find(u => u.pk === item.pk || u.username === item.username) 
+              || following.find(u => u.pk === item.pk || u.username === item.username) 
+              || { pk: item.pk || '', username: item.username, fullName: item.username, profilePicUrl: '', isVerified: false, isPrivate: false };
+            
+            const recentUser = { ...actionTarget, lastAction: actionType, actionTimestamp: Date.now() };
+
+            setRecentActivity(prev => {
+              const next = [recentUser, ...prev.filter(u => u.pk !== item.pk && u.username !== item.username)];
+              AsyncStorage.setItem(STORAGE_KEYS.RECENT_ACTIVITY, JSON.stringify(next));
+              return next;
+            });
+
+            // If skipped, we still remove them from following so they disappear from the UI
+            if (item.action === 'UNFOLLOW' || status === 'SKIPPED_UNAVAILABLE') {
+              setFollowing(prev => {
+                const next = prev.filter(u => u.pk !== item.pk && u.username !== item.username);
+                AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(next));
+                return next;
+              });
+            } else if (item.action === 'FOLLOW') {
+              setFollowing(prev => {
+                const exists = prev.some(u => u.pk === item.pk || u.username === item.username);
+                const next = exists ? prev : [recentUser, ...prev];
+                AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(next));
+                return next;
+              });
+            }
+          }}
+          onQueueFinished={() => {
+            setExecutorVisible(false);
+            setBusyPk(null);
+          }}
+        />
+
+        {/* LOGIN MODAL */}
+        <Modal visible={showLoginModal} animationType="slide">
+          <SafeAreaView style={{ flex: 1, backgroundColor: '#090A0F' }} edges={['top', 'bottom', 'left', 'right']}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', padding: 16 }}>
+              <Text style={{ color: '#FFF', fontSize: 16, fontWeight: 'bold' }}>Login to Instagram</Text>
+              <TouchableOpacity onPress={() => setShowLoginModal(false)}>
+                <Text style={{ color: '#FF3B5C' }}>Close</Text>
+              </TouchableOpacity>
+            </View>
+            <WebView
+              source={{ uri: 'https://www.instagram.com/accounts/login/' }}
+              sharedCookiesEnabled={true}
+              thirdPartyCookiesEnabled={true}
+            />
+          </SafeAreaView>
+        </Modal>
+      </View>
+    </SafeAreaProvider>
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});
