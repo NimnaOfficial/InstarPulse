@@ -2,6 +2,7 @@ package com.instapulse.data.local
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.instapulse.data.model.FriendshipStatus
 import com.instapulse.data.model.IGUser
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -43,6 +44,7 @@ class InstaPulsePreferences(context: Context) {
         private const val KEY_TOTAL_FOLLOWERS = "key_total_followers"
         private const val KEY_TOTAL_FOLLOWING = "key_total_following"
         private const val KEY_PREV_FOLLOWERS = "key_prev_followers"
+        private const val KEY_FRIENDSHIP_STATUSES = "key_friendship_statuses_v1"
     }
 
     fun saveAuth(cookieHeader: String, dsUserId: String, csrfToken: String) {
@@ -106,6 +108,44 @@ class InstaPulsePreferences(context: Context) {
         val parsed = deserializeUsers(raw)
         cachedFollowers = parsed
         return parsed
+    }
+
+    fun saveFriendshipStatuses(statuses: Map<String, FriendshipStatus>) {
+        scope.launch(Dispatchers.IO) {
+            val root = JSONObject()
+            statuses.forEach { (pk, st) ->
+                val obj = JSONObject().apply {
+                    put("following", st.following)
+                    put("followed_by", st.followed_by)
+                    put("blocking", st.blocking)
+                    put("muting", st.muting)
+                    put("is_private", st.is_private)
+                }
+                root.put(pk, obj)
+            }
+            prefs.edit().putString(KEY_FRIENDSHIP_STATUSES, root.toString()).apply()
+        }
+    }
+
+    fun getFriendshipStatuses(): Map<String, FriendshipStatus> {
+        val raw = prefs.getString(KEY_FRIENDSHIP_STATUSES, null) ?: return emptyMap()
+        val result = mutableMapOf<String, FriendshipStatus>()
+        try {
+            val root = JSONObject(raw)
+            val keys = root.keys()
+            while (keys.hasNext()) {
+                val pk = keys.next()
+                val obj = root.getJSONObject(pk)
+                result[pk] = FriendshipStatus(
+                    following = obj.optBoolean("following", false),
+                    followed_by = obj.optBoolean("followed_by", false),
+                    blocking = obj.optBoolean("blocking", false),
+                    muting = obj.optBoolean("muting", false),
+                    is_private = obj.optBoolean("is_private", false)
+                )
+            }
+        } catch (_: Exception) {}
+        return result
     }
 
     suspend fun getFollowersSuspending(): List<IGUser> = withContext(Dispatchers.IO) {

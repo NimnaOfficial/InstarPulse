@@ -63,27 +63,40 @@ fun InstaActionExecutorHud(
     ) {
         val currentItem = queue.getOrNull(currentIndex) ?: return@AnimatedVisibility
 
-        // Offscreen 375x667 WebView for executing the 3-step action script
+        // Offscreen WebView for executing action script
         val executorWebView = androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<android.webkit.WebView?>(null) }
         
-        // Execute the 3-step script when the current item changes or on load
+        // Execute script when the current item changes or on load
         androidx.compose.runtime.LaunchedEffect(currentItem.username, currentItem.action) {
             val url = "https://www.instagram.com/${currentItem.username}/"
             executorWebView.value?.loadUrl(url)
-            kotlinx.coroutines.delay(2500) // Wait for page load
+            kotlinx.coroutines.delay(2000) // Wait for page load
             val actionType = if (currentItem.action == ActionType.UNFOLLOW) "unfollow" else "follow"
-            val targetPk = currentItem.pk
+            val targetPk = currentItem.pk ?: ""
+
+            val cookieManager = android.webkit.CookieManager.getInstance()
+            val rawCookies = cookieManager.getCookie("https://www.instagram.com") ?: ""
+            var csrfToken = ""
+            rawCookies.split(";").forEach { part ->
+                val kv = part.trim().split("=", limit = 2)
+                if (kv.size == 2 && kv[0].trim() == "csrftoken") {
+                    csrfToken = kv[1].trim()
+                }
+            }
+
             val script = """
                 (async function() {
                   const actionType = '$actionType';
                   const targetPk = '$targetPk';
                   const username = '${currentItem.username}';
+                  const csrfToken = '$csrfToken';
                   const IG_APP_ID = '936619743392459';
                   
                   function getCookie(name) {
                     const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
                     return match ? decodeURIComponent(match[2]) : null;
                   }
+                  const effectiveCsrf = csrfToken || getCookie('csrftoken') || '';
                   
                   function reportNative(success) {
                     if(window.InstaNativeBridge) {
@@ -118,12 +131,12 @@ fun InstaActionExecutorHud(
                         headers: {
                           'content-type': 'application/x-www-form-urlencoded',
                           'x-ig-app-id': IG_APP_ID,
-                          'x-csrftoken': getCookie('csrftoken') || '',
+                          'x-csrftoken': effectiveCsrf,
                           'x-requested-with': 'XMLHttpRequest'
                         }
                     });
                     const data = await res.json();
-                    if (res.ok && (data.status === 'ok' || data.friendship_status)) {
+                    if (res.ok && (data.status === 'ok' || Boolean(data.friendship_status))) {
                         return reportNative(true);
                     }
                   } catch (e) {
@@ -163,8 +176,7 @@ fun InstaActionExecutorHud(
         Box(modifier = Modifier.fillMaxWidth()) {
             androidx.compose.ui.viewinterop.AndroidView(
                 modifier = Modifier
-                    .size(375.dp, 667.dp)
-                    .offset(x = (-2000).dp)
+                    .size(4.dp, 4.dp)
                     .alpha(0.02f),
                 factory = { context ->
                     android.webkit.WebView(context).apply {

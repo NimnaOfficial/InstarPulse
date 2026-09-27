@@ -70,6 +70,9 @@ fun MainApp(viewModel: InstaPulseViewModel) {
                 onLogout = viewModel::logout,
                 onLoadSampleData = { /* Removed */ },
                 onSyncProgress = viewModel::handleSyncProgress,
+                onProfileInfo = viewModel::handleProfileInfo,
+                onFollowersFetched = viewModel::handleFollowersFetched,
+                onFollowingFetched = viewModel::handleFollowingFetched,
                 onSyncComplete = viewModel::handleSyncComplete,
                 onSyncError = viewModel::handleSyncError,
                 onActionResult = viewModel::handleActionResult

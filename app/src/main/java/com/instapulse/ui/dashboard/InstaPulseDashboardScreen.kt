@@ -115,7 +115,10 @@ fun InstaPulseDashboardScreen(
     onOpenLoginModal: () -> Unit,
     onLogout: () -> Unit,
     onLoadSampleData: () -> Unit,
-    onSyncProgress: (String, Int) -> Unit,
+    onSyncProgress: (String, Int, String) -> Unit = { _, _, _ -> },
+    onProfileInfo: (String, String, Int, Int) -> Unit = { _, _, _, _ -> },
+    onFollowersFetched: (String) -> Unit = {},
+    onFollowingFetched: (String) -> Unit = {},
     onSyncComplete: (String) -> Unit,
     onSyncError: (String) -> Unit,
     onActionResult: (String, String, Boolean) -> Unit
@@ -144,7 +147,7 @@ fun InstaPulseDashboardScreen(
     )
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // Persistent 1dp WebView for dynamic sync
+        // Persistent background WebView mounted at (0.dp, 0.dp) with 4dp size so Android Chromium never pauses JS fetch/timers
         val webView = remember { mutableStateOf<android.webkit.WebView?>(null) }
         
         androidx.compose.runtime.LaunchedEffect(state.jsCommand) {
@@ -155,8 +158,7 @@ fun InstaPulseDashboardScreen(
 
         AndroidView(
             modifier = Modifier
-                .size(375.dp, 667.dp)
-                .offset(x = (-2000).dp)
+                .size(4.dp, 4.dp)
                 .alpha(0.02f),
             factory = { context ->
                 android.webkit.WebView(context).apply {
@@ -164,7 +166,11 @@ fun InstaPulseDashboardScreen(
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         databaseEnabled = true
-                        // DO NOT override userAgentString!
+                        loadsImagesAutomatically = false
+                        blockNetworkImage = true
+                        cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
+                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        userAgentString = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                     }
                     val cookieManager = android.webkit.CookieManager.getInstance()
                     cookieManager.setAcceptCookie(true)
@@ -177,10 +183,28 @@ fun InstaPulseDashboardScreen(
                                 val json = org.json.JSONObject(jsonString)
                                 val type = json.optString("type")
                                 when (type) {
+                                    "PROFILE_INFO" -> {
+                                        val u = json.optString("username")
+                                        val a = json.optString("avatarUrl")
+                                        val fol = json.optInt("followerCount")
+                                        val fing = json.optInt("followingCount")
+                                        onProfileInfo(u, a, fol, fing)
+                                    }
                                     "SYNC_PROGRESS" -> {
                                         val edgeType = json.optString("edgeType")
                                         val count = json.optInt("count")
-                                        onSyncProgress(edgeType, count)
+                                        val phase = json.optString("phase")
+                                        onSyncProgress(edgeType, count, phase)
+                                    }
+                                    "STATUS" -> {
+                                        val msg = json.optString("message")
+                                        onSyncProgress("", 0, msg)
+                                    }
+                                    "FOLLOWERS_FETCHED", "FOLLOWERS_LOADED" -> {
+                                        onFollowersFetched(jsonString)
+                                    }
+                                    "FOLLOWING_FETCHED", "FOLLOWING_LOADED" -> {
+                                        onFollowingFetched(jsonString)
                                     }
                                     "SYNC_SUCCESS" -> {
                                         onSyncComplete(jsonString)
@@ -195,14 +219,16 @@ fun InstaPulseDashboardScreen(
                                         val success = json.optBoolean("success")
                                         onActionResult(targetPk, actionType, success)
                                     }
-                                    // other types like AUTH_STATUS can be handled if needed
                                 }
                             } catch (e: Exception) {
                                 e.printStackTrace()
                             }
                         }
                     }
-                    addJavascriptInterface(InstaJsBridge(), "InstaNativeBridge")
+                    val jsBridge = InstaJsBridge()
+                    addJavascriptInterface(jsBridge, "InstaNativeBridge")
+                    addJavascriptInterface(jsBridge, "ReactNativeWebView")
+                    addJavascriptInterface(jsBridge, "AndroidBridge")
                     loadUrl("https://www.instagram.com/")
                     webView.value = this
                 }
@@ -461,7 +487,7 @@ fun InstaPulseDashboardScreen(
                 }
             }
 
-            // Multi-Stage Animated Sync Progress Banner (3-Phase GraphQL + show_many matrix)
+            // Multi-Stage Animated Sync Progress Banner (Fault-Tolerant Dual-Engine GraphQL + REST)
             if (state.isSyncing) {
                 item(key = "sync_progress_banner", contentType = "progress_banner") {
                     SyncProgressBanner(
@@ -513,7 +539,7 @@ fun InstaPulseDashboardScreen(
                     ) {
                         // Reciprocity % with circular arc gauge
                         val animatedReciprocityFraction by animateFloatAsState(
-                            targetValue = (state.reciprocityPercent.toFloat() / 100f).coerceIn(0f, 1f),
+                            targetValue = ((state.reciprocityPercent.toFloatOrNull() ?: 0f) / 100f).coerceIn(0f, 1f),
                             animationSpec = tween(700, easing = FastOutSlowInEasing),
                             label = "reciprocityGauge"
                         )

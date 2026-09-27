@@ -14,6 +14,15 @@ data class IGUser(
     val actionTimestamp: Long? = null
 )
 
+@Immutable
+data class FriendshipStatus(
+    val following: Boolean = false,
+    val followed_by: Boolean = false,
+    val blocking: Boolean = false,
+    val muting: Boolean = false,
+    val is_private: Boolean = false
+)
+
 data class ActionQueueItem(
     val pk: String? = null,
     val username: String,
