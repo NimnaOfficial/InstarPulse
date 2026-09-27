@@ -1,0 +1,6 @@
+{
+  "name": "InstaPulse",
+  "description": "Instagram relationship intelligence engine: track followers, unfollowers, mutuals, and ghost accounts with safe action queue",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
