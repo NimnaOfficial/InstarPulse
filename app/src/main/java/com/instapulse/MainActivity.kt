@@ -13,6 +13,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import com.instapulse.data.bridge.HeadlessWebViewBridgeHost
 import com.instapulse.ui.InstaPulseViewModel
 import com.instapulse.ui.dashboard.InstaPulseDashboardScreen
 import com.instapulse.ui.login.InstagramLoginDialog
@@ -33,6 +34,11 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        viewModel.onTrimMemory(level)
+    }
 }
 
 @Composable
@@ -43,6 +49,9 @@ fun MainApp(viewModel: InstaPulseViewModel) {
     val showLoginModal by viewModel.showLoginModal.collectAsState()
 
     Box(modifier = Modifier.fillMaxSize()) {
+        // Persistent Headless WebView JS Bridge (handles real TLS/session fetch calls)
+        HeadlessWebViewBridgeHost(bridge = viewModel.webViewBridge)
+
         if (showSplash) {
             CinematicSplashScreen(
                 onFinish = { viewModel.finishSplash() }

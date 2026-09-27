@@ -9,9 +9,24 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -47,6 +62,7 @@ fun InstagramLoginDialog(
                 .fillMaxSize()
                 .background(Color(0xFF090A0F))
                 .systemBarsPadding()
+                .imePadding()
         ) {
             // Top Header Bar
             Row(
@@ -104,8 +120,14 @@ fun InstagramLoginDialog(
                                 databaseEnabled = true
                                 loadsImagesAutomatically = true
                                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                                // Strip "; wv" so Instagram renders the mobile web login form
-                                userAgentString = userAgentString.replace("; wv", "")
+                                useWideViewPort = true
+                                loadWithOverviewMode = true
+                                setSupportZoom(true)
+                                builtInZoomControls = true
+                                displayZoomControls = false
+                                layoutAlgorithm = WebSettings.LayoutAlgorithm.TEXT_AUTOSIZING
+                                // Responsive Mobile User-Agent
+                                userAgentString = "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                             }
 
                             val cookieManager = CookieManager.getInstance()
@@ -118,7 +140,7 @@ fun InstagramLoginDialog(
                                     request: WebResourceRequest?
                                 ): Boolean {
                                     val url = request?.url?.toString() ?: return false
-                                    // Block intent:// and instagram:// redirects that cause blank screens
+                                    // Block intent:// and instagram:// app redirects that blank WebView
                                     return !(url.startsWith("http://") || url.startsWith("https://"))
                                 }
 
@@ -134,14 +156,20 @@ fun InstagramLoginDialog(
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     isLoadingPage = false
                                     statusText = "Sign in with your Instagram account"
+
+                                    // Viewport meta fix for perfect responsive fit
+                                    view?.evaluateJavascript(
+                                        "(function(){ var m = document.querySelector('meta[name=viewport]'); if(!m){ m = document.createElement('meta'); m.name='viewport'; document.head.appendChild(m); } m.content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'; document.body.style.overflowX='hidden'; })();",
+                                        null
+                                    )
+
                                     cookieManager.flush()
 
                                     val cookies = cookieManager.getCookie("https://www.instagram.com") ?: ""
                                     val dsUserId = extractCookieValue(cookies, "ds_user_id")
                                     val csrfToken = extractCookieValue(cookies, "csrftoken")
-                                    val sessionId = extractCookieValue(cookies, "sessionid")
 
-                                    if (!hasCompletedLogin && !dsUserId.isNullOrBlank() && !csrfToken.isNullOrBlank() && !sessionId.isNullOrBlank()) {
+                                    if (!hasCompletedLogin && !dsUserId.isNullOrBlank() && !csrfToken.isNullOrBlank()) {
                                         hasCompletedLogin = true
                                         statusText = "Connected! Syncing your graph..."
                                         onLoginSuccess(cookies, dsUserId, csrfToken)

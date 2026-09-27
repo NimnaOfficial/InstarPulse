@@ -1,19 +1,28 @@
 package com.instapulse.ui.dashboard
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -49,9 +58,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -65,13 +80,17 @@ import com.instapulse.ui.theme.CanvasBg
 import com.instapulse.ui.theme.CardBg
 import com.instapulse.ui.theme.CardBorder
 import com.instapulse.ui.theme.Crimson
-import com.instapulse.ui.theme.Cyan
 import com.instapulse.ui.theme.Emerald
 import com.instapulse.ui.theme.IgPink
-import com.instapulse.ui.theme.Purple
+import com.instapulse.ui.theme.IgPulseGradient
+import com.instapulse.ui.theme.MutualViolet
+import com.instapulse.ui.theme.RecentsCyan
 import com.instapulse.ui.theme.TextMuted
 import com.instapulse.ui.theme.TextPrimary
 import com.instapulse.ui.theme.TextSecondary
+import com.instapulse.ui.theme.TraitorCrimson
+import com.instapulse.ui.theme.ambientAuroraBackground
+import com.instapulse.ui.theme.hyperGlassCard
 
 @Composable
 fun InstaPulseDashboardScreen(
@@ -91,6 +110,8 @@ fun InstaPulseDashboardScreen(
     onLogout: () -> Unit,
     onLoadSampleData: () -> Unit
 ) {
+    val haptic = LocalHapticFeedback.current
+
     val syncSubtitle = if (state.isSyncing) {
         "⚡ Syncing real-time graph..."
     } else if (state.lastSyncTime > 0) {
@@ -100,55 +121,128 @@ fun InstaPulseDashboardScreen(
         "🟢 Ready to Sync"
     }
 
+    // Breathing neon status dot animation for zero-recomposition draw-phase
+    val infiniteTransition = rememberInfiniteTransition(label = "pulseAlpha")
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(900, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulseAlpha"
+    )
+
     Scaffold(
         containerColor = CanvasBg,
         bottomBar = {
+            // Floating Glassmorphic Batch Queue Dock
             AnimatedVisibility(
                 visible = state.checkedPks.isNotEmpty(),
-                enter = slideInVertically(initialOffsetY = { it }),
-                exit = slideOutVertically(targetOffsetY = { it })
+                enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+                exit = slideOutVertically(targetOffsetY = { it }) + fadeOut()
             ) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .navigationBarsPadding()
-                        .background(Color(0xF0131724))
-                        .border(1.dp, Color(0x20FFFFFF), RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
-                        .padding(horizontal = 20.dp, vertical = 14.dp)
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                        .hyperGlassCard(accentColor = RecentsCyan, isSelected = true, cornerRadius = 20.dp)
+                        .padding(horizontal = 18.dp, vertical = 14.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text(
-                                text = "${state.checkedPks.size} Accounts Queued",
-                                color = TextPrimary,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                            Text(
-                                text = "Fast Sequential Queue Active",
-                                color = Cyan,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
+                    Column {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(RecentsCyan)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "${state.checkedPks.size} Accounts Queued",
+                                        color = TextPrimary,
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Black
+                                    )
+                                }
+                                Text(
+                                    text = "Ready for execution",
+                                    color = RecentsCyan,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(Color(0x18FFFFFF))
+                                        .clickable {
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onClearChecked()
+                                        }
+                                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "Clear",
+                                        color = TextSecondary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(
+                                            Brush.horizontalGradient(
+                                                listOf(RecentsCyan, Color(0xFF0284C7))
+                                            )
+                                        )
+                                        .clickable {
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onStartBatchQueue()
+                                        }
+                                        .padding(horizontal = 16.dp, vertical = 9.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "⚡ Execute (${state.checkedPks.size})",
+                                        color = Color.Black,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Black
+                                    )
+                                }
+                            }
                         }
 
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // Live neon progress bar
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(Cyan)
-                                .clickable { onStartBatchQueue() }
-                                .padding(horizontal = 18.dp, vertical = 10.dp),
-                            contentAlignment = Alignment.Center
+                                .fillMaxWidth()
+                                .height(3.dp)
+                                .clip(RoundedCornerShape(1.5.dp))
+                                .background(Color(0x20FFFFFF))
                         ) {
-                            Text(
-                                text = "Execute All (${state.checkedPks.size})",
-                                color = Color.Black,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.ExtraBold
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.5f)
+                                    .height(3.dp)
+                                    .clip(RoundedCornerShape(1.5.dp))
+                                    .background(
+                                        Brush.horizontalGradient(IgPulseGradient)
+                                    )
                             )
                         }
                     }
@@ -159,6 +253,7 @@ fun InstaPulseDashboardScreen(
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
+                .ambientAuroraBackground()
                 .statusBarsPadding()
                 .padding(innerPadding),
             contentPadding = PaddingValues(bottom = 90.dp)
@@ -174,17 +269,21 @@ fun InstaPulseDashboardScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            // Breathing neon status dot
                             Box(
                                 modifier = Modifier
-                                    .size(8.dp)
+                                    .size(9.dp)
+                                    .graphicsLayer {
+                                        alpha = pulseAlpha
+                                    }
                                     .clip(CircleShape)
-                                    .background(if (state.isSyncing) Cyan else Emerald)
+                                    .background(if (state.isSyncing) RecentsCyan else Emerald)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
                                 text = if (state.myUsername.isNotEmpty()) "@${state.myUsername}" else "InstaPulse",
                                 color = TextPrimary,
-                                fontSize = 20.sp,
+                                fontSize = 21.sp,
                                 fontWeight = FontWeight.Black,
                                 letterSpacing = 0.2.sp
                             )
@@ -204,7 +303,7 @@ fun InstaPulseDashboardScreen(
                             }
                         }
                         Text(
-                            text = "${state.totalFollowersCount} Followers • ${state.totalFollowingCount} Following  |  $syncSubtitle",
+                            text = "${state.originalFollowersCount} Followers • ${state.originalFollowingCount} Following  |  $syncSubtitle",
                             color = TextSecondary,
                             fontSize = 11.sp,
                             modifier = Modifier.padding(top = 4.dp)
@@ -215,13 +314,14 @@ fun InstaPulseDashboardScreen(
                         // Sync Button
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(10.dp))
+                                .clip(RoundedCornerShape(12.dp))
                                 .background(CardBg)
-                                .border(1.dp, IgPink, RoundedCornerShape(10.dp))
+                                .border(1.2.dp, IgPink, RoundedCornerShape(12.dp))
                                 .clickable(enabled = !state.isSyncing) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     if (state.isLoggedIn) onStartLiveSync() else onOpenLoginModal()
                                 }
-                                .padding(horizontal = 12.dp, vertical = 7.dp),
+                                .padding(horizontal = 13.dp, vertical = 7.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             if (state.isSyncing) {
@@ -245,10 +345,13 @@ fun InstaPulseDashboardScreen(
                         if (state.isLoggedIn) {
                             Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(10.dp))
+                                    .clip(RoundedCornerShape(12.dp))
                                     .background(Color(0x1AFF3B5C))
-                                    .border(1.dp, Color(0x33FF3B5C), RoundedCornerShape(10.dp))
-                                    .clickable { onLogout() }
+                                    .border(1.dp, Color(0x33FF3B5C), RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        onLogout()
+                                    }
                                     .padding(horizontal = 10.dp, vertical = 7.dp)
                             ) {
                                 Text(
@@ -261,15 +364,18 @@ fun InstaPulseDashboardScreen(
                         } else {
                             Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(10.dp))
+                                    .clip(RoundedCornerShape(12.dp))
                                     .background(Color(0x15FFFFFF))
-                                    .border(1.dp, Color(0x25FFFFFF), RoundedCornerShape(10.dp))
-                                    .clickable { onLoadSampleData() }
+                                    .border(1.dp, Color(0x25FFFFFF), RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        onLoadSampleData()
+                                    }
                                     .padding(horizontal = 10.dp, vertical = 7.dp)
                             ) {
                                 Text(
                                     text = "Sample Data",
-                                    color = Cyan,
+                                    color = RecentsCyan,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.Bold
                                 )
@@ -279,7 +385,7 @@ fun InstaPulseDashboardScreen(
                 }
             }
 
-            // Multi-Stage Animated Sync Progress Banner
+            // Multi-Stage Animated Sync Progress Banner (3-Phase GraphQL + show_many matrix)
             if (state.isSyncing) {
                 item(key = "sync_progress_banner", contentType = "progress_banner") {
                     SyncProgressBanner(
@@ -290,7 +396,7 @@ fun InstaPulseDashboardScreen(
                 }
             }
 
-            // Dedicated 2-Card Hero Summary Row (Current Followers & Current Following)
+            // Dedicated 2-Card Hero Summary Row with Animated Slot-Machine Rolling Numbers
             item(key = "hero_summary_row", contentType = "hero_summary") {
                 Row(
                     modifier = Modifier
@@ -301,29 +407,27 @@ fun InstaPulseDashboardScreen(
                     HeroStatCard(
                         modifier = Modifier.weight(1f),
                         title = "CURRENT FOLLOWERS",
-                        count = state.totalFollowersCount,
+                        count = state.originalFollowersCount,
                         badgeColor = Emerald,
                         icon = Icons.Default.People
                     )
                     HeroStatCard(
                         modifier = Modifier.weight(1f),
                         title = "CURRENT FOLLOWING",
-                        count = state.totalFollowingCount,
-                        badgeColor = Cyan,
+                        count = state.originalFollowingCount,
+                        badgeColor = RecentsCyan,
                         icon = Icons.Default.PersonAdd
                     )
                 }
             }
 
-            // Telemetry Strip
+            // Cyber-Telemetry Gauge Strip with Custom Canvas Circular Progress Ring
             item(key = "telemetry_strip", contentType = "telemetry") {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 8.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(CardBg)
-                        .border(1.dp, CardBorder, RoundedCornerShape(16.dp))
+                        .hyperGlassCard(cornerRadius = 16.dp)
                         .padding(vertical = 12.dp, horizontal = 16.dp)
                 ) {
                     Row(
@@ -331,21 +435,58 @@ fun InstaPulseDashboardScreen(
                         horizontalArrangement = Arrangement.SpaceAround,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(
-                                text = "RECIPROCITY",
-                                fontSize = 10.sp,
-                                color = TextSecondary,
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 0.5.sp
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "${state.reciprocityPercent}%",
-                                fontSize = 16.sp,
-                                color = TextPrimary,
-                                fontWeight = FontWeight.Black
-                            )
+                        // Reciprocity % with circular arc gauge
+                        val animatedReciprocityFraction by animateFloatAsState(
+                            targetValue = (state.reciprocityPercent.toFloat() / 100f).coerceIn(0f, 1f),
+                            animationSpec = tween(700, easing = FastOutSlowInEasing),
+                            label = "reciprocityGauge"
+                        )
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier.size(32.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Canvas(modifier = Modifier.fillMaxSize()) {
+                                    drawArc(
+                                        color = Color(0x20FFFFFF),
+                                        startAngle = -90f,
+                                        sweepAngle = 360f,
+                                        useCenter = false,
+                                        style = Stroke(width = 3.dp.toPx())
+                                    )
+                                    drawArc(
+                                        brush = Brush.sweepGradient(IgPulseGradient),
+                                        startAngle = -90f,
+                                        sweepAngle = animatedReciprocityFraction * 360f,
+                                        useCenter = false,
+                                        style = Stroke(width = 3.dp.toPx())
+                                    )
+                                }
+                                Text(
+                                    text = "★",
+                                    fontSize = 11.sp,
+                                    color = Emerald
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(8.dp))
+
+                            Column {
+                                Text(
+                                    text = "RECIPROCITY",
+                                    fontSize = 9.sp,
+                                    color = TextSecondary,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.5.sp
+                                )
+                                Text(
+                                    text = "${state.reciprocityPercent}%",
+                                    fontSize = 15.sp,
+                                    color = TextPrimary,
+                                    fontWeight = FontWeight.Black
+                                )
+                            }
                         }
 
                         Box(modifier = Modifier.width(1.dp).height(24.dp).background(Color(0x1AFFFFFF)))
@@ -353,7 +494,7 @@ fun InstaPulseDashboardScreen(
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(
                                 text = "FOLLOWER RATIO",
-                                fontSize = 10.sp,
+                                fontSize = 9.sp,
                                 color = TextSecondary,
                                 fontWeight = FontWeight.Bold,
                                 letterSpacing = 0.5.sp
@@ -361,7 +502,7 @@ fun InstaPulseDashboardScreen(
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = "${state.followerRatioStr}x",
-                                fontSize = 16.sp,
+                                fontSize = 15.sp,
                                 color = TextPrimary,
                                 fontWeight = FontWeight.Black
                             )
@@ -372,7 +513,7 @@ fun InstaPulseDashboardScreen(
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(
                                 text = "NET DELTA",
-                                fontSize = 10.sp,
+                                fontSize = 9.sp,
                                 color = TextSecondary,
                                 fontWeight = FontWeight.Bold,
                                 letterSpacing = 0.5.sp
@@ -380,7 +521,7 @@ fun InstaPulseDashboardScreen(
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = if (state.netDelta > 0) "+${state.netDelta}" else "${state.netDelta}",
-                                fontSize = 16.sp,
+                                fontSize = 15.sp,
                                 color = if (state.netDelta > 0) Emerald else if (state.netDelta < 0) Crimson else TextPrimary,
                                 fontWeight = FontWeight.Black
                             )
@@ -389,7 +530,7 @@ fun InstaPulseDashboardScreen(
                 }
             }
 
-            // Bento Grid Cards
+            // Tactile 2x2 Bento Grid Cards with Spring Physics Press Feedback
             item(key = "bento_grid", contentType = "bento_grid") {
                 Column(modifier = Modifier.padding(horizontal = 16.dp)) {
                     // Bento Row 1
@@ -401,11 +542,14 @@ fun InstaPulseDashboardScreen(
                             modifier = Modifier.weight(1f),
                             count = state.notFollowingBackCount,
                             badgeText = "TRAITORS",
-                            badgeColor = Crimson,
+                            badgeColor = TraitorCrimson,
                             title = "Not Following Back",
-                            progress = (state.notFollowingBackCount.toFloat() / state.totalFollowingCount.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f),
+                            progress = (state.notFollowingBackCount.toFloat() / state.originalFollowingCount.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f),
                             isSelected = state.activeTab == TabCategory.DONT_FOLLOW_BACK,
-                            onClick = { onTabSelected(TabCategory.DONT_FOLLOW_BACK) }
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onTabSelected(TabCategory.DONT_FOLLOW_BACK)
+                            }
                         )
 
                         BentoCard(
@@ -414,9 +558,12 @@ fun InstaPulseDashboardScreen(
                             badgeText = "FANS",
                             badgeColor = Emerald,
                             title = "Loyal Followers",
-                            progress = (state.fansCount.toFloat() / state.totalFollowersCount.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f),
+                            progress = (state.fansCount.toFloat() / state.originalFollowersCount.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f),
                             isSelected = state.activeTab == TabCategory.FANS,
-                            onClick = { onTabSelected(TabCategory.FANS) }
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onTabSelected(TabCategory.FANS)
+                            }
                         )
                     }
 
@@ -431,22 +578,28 @@ fun InstaPulseDashboardScreen(
                             modifier = Modifier.weight(1f),
                             count = state.recentsCount,
                             badgeText = "RECENTS",
-                            badgeColor = Cyan,
+                            badgeColor = RecentsCyan,
                             title = "Action History",
                             progress = 1f,
                             isSelected = state.activeTab == TabCategory.RECENTS,
-                            onClick = { onTabSelected(TabCategory.RECENTS) }
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onTabSelected(TabCategory.RECENTS)
+                            }
                         )
 
                         BentoCard(
                             modifier = Modifier.weight(1f),
                             count = state.mutualsCount,
                             badgeText = "MUTUALS",
-                            badgeColor = Purple,
+                            badgeColor = MutualViolet,
                             title = "Mutual Connections",
-                            progress = (state.mutualsCount.toFloat() / state.totalFollowingCount.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f),
+                            progress = (state.mutualsCount.toFloat() / state.originalFollowingCount.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f),
                             isSelected = state.activeTab == TabCategory.MUTUALS,
-                            onClick = { onTabSelected(TabCategory.MUTUALS) }
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onTabSelected(TabCategory.MUTUALS)
+                            }
                         )
                     }
 
@@ -456,14 +609,15 @@ fun InstaPulseDashboardScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(CardBg)
-                            .border(
-                                1.5.dp,
-                                if (state.activeTab == TabCategory.WHITELISTED) Cyan else Color(0x10FFFFFF),
-                                RoundedCornerShape(16.dp)
+                            .hyperGlassCard(
+                                accentColor = if (state.activeTab == TabCategory.WHITELISTED) RecentsCyan else null,
+                                isSelected = state.activeTab == TabCategory.WHITELISTED,
+                                cornerRadius = 16.dp
                             )
-                            .clickable { onTabSelected(TabCategory.WHITELISTED) }
+                            .clickable {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onTabSelected(TabCategory.WHITELISTED)
+                            }
                             .padding(horizontal = 16.dp, vertical = 14.dp)
                     ) {
                         Row(
@@ -475,7 +629,7 @@ fun InstaPulseDashboardScreen(
                                 Icon(
                                     imageVector = Icons.Default.Shield,
                                     contentDescription = "Shield",
-                                    tint = Cyan,
+                                    tint = RecentsCyan,
                                     modifier = Modifier.size(20.dp)
                                 )
                                 Spacer(modifier = Modifier.width(10.dp))
@@ -529,7 +683,7 @@ fun InstaPulseDashboardScreen(
                                     color = TextPrimary,
                                     fontSize = 14.sp
                                 ),
-                                cursorBrush = SolidColor(Cyan),
+                                cursorBrush = SolidColor(RecentsCyan),
                                 modifier = Modifier.fillMaxWidth(),
                                 decorationBox = { innerTextField ->
                                     if (state.searchQuery.isEmpty()) {
@@ -563,14 +717,17 @@ fun InstaPulseDashboardScreen(
                                 Box(
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(12.dp))
-                                        .background(if (active) Color(0x2638BDF8) else Color(0x0DFFFFFF))
-                                        .border(1.dp, if (active) Cyan else Color.Transparent, RoundedCornerShape(12.dp))
-                                        .clickable { onSubFilterSelected(f) }
+                                        .background(if (active) Color(0x2600E5FF) else Color(0x0DFFFFFF))
+                                        .border(1.dp, if (active) RecentsCyan else Color.Transparent, RoundedCornerShape(12.dp))
+                                        .clickable {
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onSubFilterSelected(f)
+                                        }
                                         .padding(horizontal = 10.dp, vertical = 6.dp)
                                 ) {
                                     Text(
                                         text = label,
-                                        color = if (active) Cyan else TextSecondary,
+                                        color = if (active) RecentsCyan else TextSecondary,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.SemiBold
                                     )
@@ -587,12 +744,15 @@ fun InstaPulseDashboardScreen(
                         }
                         Box(
                             modifier = Modifier
-                                .clickable { onCycleSort() }
+                                .clickable {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onCycleSort()
+                                }
                                 .padding(horizontal = 6.dp, vertical = 6.dp)
                         ) {
                             Text(
                                 text = sortLabel,
-                                color = Cyan,
+                                color = RecentsCyan,
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold
                             )
@@ -624,8 +784,9 @@ fun InstaPulseDashboardScreen(
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(15.dp))
-                                .background(if (hasSelection) Cyan else Color(0x15FFFFFF))
+                                .background(if (hasSelection) RecentsCyan else Color(0x15FFFFFF))
                                 .clickable {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     if (hasSelection) onClearChecked() else onSelectAllVisible(state.displayedUsers.map { it.pk })
                                 }
                                 .padding(horizontal = 12.dp, vertical = 6.dp)
@@ -725,9 +886,8 @@ fun SyncProgressBanner(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 6.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Color(0xFF131724))
-            .border(1.5.dp, Brush.horizontalGradient(listOf(Color(0xFFF58529), Color(0xFFDD2A7B), Color(0xFF8134AF))), RoundedCornerShape(16.dp))
+            .hyperGlassCard(cornerRadius = 16.dp)
+            .border(1.5.dp, Brush.horizontalGradient(IgPulseGradient), RoundedCornerShape(16.dp))
             .padding(14.dp)
     ) {
         Column {
@@ -745,7 +905,7 @@ fun SyncProgressBanner(
 
                 CircularProgressIndicator(
                     modifier = Modifier.size(14.dp),
-                    color = Color(0xFFDD2A7B),
+                    color = IgPink,
                     strokeWidth = 2.dp
                 )
             }
@@ -754,7 +914,7 @@ fun SyncProgressBanner(
 
             Text(
                 text = counterText,
-                color = Cyan,
+                color = RecentsCyan,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold
             )
@@ -775,13 +935,7 @@ fun SyncProgressBanner(
                         .height(6.dp)
                         .clip(RoundedCornerShape(3.dp))
                         .background(
-                            Brush.horizontalGradient(
-                                listOf(
-                                    Color(0xFFF58529),
-                                    Color(0xFFDD2A7B),
-                                    Color(0xFF8134AF)
-                                )
-                            )
+                            Brush.horizontalGradient(IgPulseGradient)
                         )
                 )
 
@@ -806,7 +960,7 @@ fun SyncProgressBanner(
     }
 }
 
-// Hero Summary Card
+// Hero Summary Card with Slot-Machine Rolling Numbers and Sheen Sweep
 @Composable
 fun HeroStatCard(
     modifier: Modifier = Modifier,
@@ -815,11 +969,32 @@ fun HeroStatCard(
     badgeColor: Color,
     icon: androidx.compose.ui.graphics.vector.ImageVector
 ) {
+    val infiniteTransition = rememberInfiniteTransition(label = "heroSheen")
+    val sheenProgress by infiniteTransition.animateFloat(
+        initialValue = -0.5f,
+        targetValue = 1.5f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2800, delayMillis = 400, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "sheenProgress"
+    )
+
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(16.dp))
-            .background(CardBg)
-            .border(1.dp, CardBorder, RoundedCornerShape(16.dp))
+            .hyperGlassCard(cornerRadius = 16.dp)
+            .drawWithCache {
+                val sheenX = size.width * sheenProgress
+                val sheenBrush = Brush.linearGradient(
+                    colors = listOf(Color.Transparent, Color(0x18FFFFFF), Color.Transparent),
+                    start = Offset(sheenX, 0f),
+                    end = Offset(sheenX + 60.dp.toPx(), size.height)
+                )
+                onDrawWithContent {
+                    drawContent()
+                    drawRect(brush = sheenBrush)
+                }
+            }
             .padding(14.dp)
     ) {
         Column {
@@ -845,16 +1020,32 @@ fun HeroStatCard(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            Text(
-                text = "$count",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Black,
-                color = TextPrimary
-            )
+            // Animated Slot-Machine Rolling Number
+            AnimatedContent(
+                targetState = count,
+                transitionSpec = {
+                    if (targetState > initialState) {
+                        slideInVertically { it } + fadeIn() togetherWith
+                                slideOutVertically { -it } + fadeOut()
+                    } else {
+                        slideInVertically { -it } + fadeIn() togetherWith
+                                slideOutVertically { it } + fadeOut()
+                    }
+                },
+                label = "rollingStat"
+            ) { targetCount ->
+                Text(
+                    text = "$targetCount",
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Black,
+                    color = TextPrimary
+                )
+            }
         }
     }
 }
 
+// Tactile 2x2 Bento Card with 3D Spring-Physics Press Feedback
 @Composable
 fun BentoCard(
     modifier: Modifier = Modifier,
@@ -866,16 +1057,38 @@ fun BentoCard(
     isSelected: Boolean,
     onClick: () -> Unit
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed) 0.94f else 1.0f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "bentoScale"
+    )
+
+    val animatedFillProgress by animateFloatAsState(
+        targetValue = progress.coerceIn(0.02f, 1f),
+        animationSpec = tween(durationMillis = 600, easing = FastOutSlowInEasing),
+        label = "bentoFillProgress"
+    )
+
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(16.dp))
-            .background(CardBg)
-            .border(
-                width = 1.5.dp,
-                color = if (isSelected) badgeColor else Color(0x10FFFFFF),
-                shape = RoundedCornerShape(16.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .hyperGlassCard(
+                accentColor = if (isSelected) badgeColor else null,
+                isSelected = isSelected,
+                cornerRadius = 16.dp
             )
-            .clickable { onClick() }
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null
+            ) { onClick() }
             .padding(14.dp)
     ) {
         Column {
@@ -884,12 +1097,21 @@ fun BentoCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "$count",
-                    fontSize = 26.sp,
-                    fontWeight = FontWeight.Black,
-                    color = TextPrimary
-                )
+                // Slot-machine rolling number for Bento counters
+                AnimatedContent(
+                    targetState = count,
+                    transitionSpec = {
+                        slideInVertically { it } + fadeIn() togetherWith slideOutVertically { -it } + fadeOut()
+                    },
+                    label = "bentoCount"
+                ) { targetNum ->
+                    Text(
+                        text = "$targetNum",
+                        fontSize = 26.sp,
+                        fontWeight = FontWeight.Black,
+                        color = TextPrimary
+                    )
+                }
 
                 Box(
                     modifier = Modifier
@@ -917,6 +1139,7 @@ fun BentoCard(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            // Animated Bottom Fill Bar showing proportion of graph
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -926,7 +1149,7 @@ fun BentoCard(
             ) {
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth(progress.coerceIn(0.02f, 1f))
+                        .fillMaxWidth(animatedFillProgress)
                         .height(4.dp)
                         .clip(RoundedCornerShape(2.dp))
                         .background(badgeColor)

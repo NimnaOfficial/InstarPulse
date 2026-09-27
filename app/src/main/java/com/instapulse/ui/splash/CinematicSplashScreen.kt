@@ -37,11 +37,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.instapulse.ui.theme.CanvasBg
 import com.instapulse.ui.theme.IgPink
+import com.instapulse.ui.theme.IgPulseGradient
+import com.instapulse.ui.theme.RecentsCyan
 import com.instapulse.ui.theme.TextMuted
 import com.instapulse.ui.theme.TextPrimary
 import com.instapulse.ui.theme.TextSecondary
+import com.instapulse.ui.theme.ambientAuroraBackground
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -121,7 +123,7 @@ fun CinematicSplashScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(CanvasBg)
+            .ambientAuroraBackground()
             .scale(exitScale.value)
             .alpha(exitAlpha.value),
         contentAlignment = Alignment.Center
@@ -173,17 +175,17 @@ fun CinematicSplashScreen(
                         .clip(RoundedCornerShape(24.dp))
                         .background(
                             Brush.linearGradient(
-                                colors = listOf(IgPink, Color(0xFF8134AF))
+                                colors = IgPulseGradient
                             )
                         )
-                        .padding(3.dp),
+                        .padding(2.5.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .clip(RoundedCornerShape(21.dp))
-                            .background(Color(0xFF121520)),
+                            .background(Color(0xFF0F121C)),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
@@ -250,7 +252,7 @@ fun CinematicSplashScreen(
                         .clip(RoundedCornerShape(2.dp))
                         .background(
                             Brush.horizontalGradient(
-                                colors = listOf(IgPink, Color(0xFF38BDF8))
+                                colors = listOf(IgPink, RecentsCyan)
                             )
                         )
                 )

@@ -4,6 +4,8 @@ import android.app.Application
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.instapulse.data.bridge.InstaBridgeCallback
+import com.instapulse.data.bridge.InstaWebViewBridge
 import com.instapulse.data.local.InstaPulsePreferences
 import com.instapulse.data.model.ActionQueueItem
 import com.instapulse.data.model.ActionType
@@ -19,18 +21,22 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
 import java.util.Locale
 import kotlin.random.Random
+
+data class FriendshipStatus(
+    val following: Boolean,
+    val followedBy: Boolean,
+    val outgoingRequest: Boolean = false
+)
 
 @Immutable
 data class DashboardUiState(
     val displayedUsers: List<IGUser> = emptyList(),
-    val totalFollowersCount: Int = 0,
-    val totalFollowingCount: Int = 0,
+    val originalFollowersCount: Int = 0,
+    val originalFollowingCount: Int = 0,
     val notFollowingBackCount: Int = 0,
     val fansCount: Int = 0,
     val mutualsCount: Int = 0,
@@ -66,14 +72,19 @@ data class ExecutorUiState(
     val statusMessage: String = "Initializing execution engine..."
 )
 
-class InstaPulseViewModel(application: Application) : AndroidViewModel(application) {
+class InstaPulseViewModel(application: Application) : AndroidViewModel(application), InstaBridgeCallback {
     private val prefs = InstaPulsePreferences(application)
 
-    // In-memory data store for zero-lag updates
+    val webViewBridge = InstaWebViewBridge(this)
+
+    // In-memory data store for zero-lag calculations
     private var rawFollowers: List<IGUser> = emptyList()
     private var rawFollowing: List<IGUser> = emptyList()
     private var rawRecent: List<IGUser> = emptyList()
     private var rawWhitelist: Set<String> = emptySet()
+    private var rawFriendshipStatuses: Map<String, FriendshipStatus> = emptyMap()
+    private var originalFollowersCount: Int = 0
+    private var originalFollowingCount: Int = 0
     private var checkedPks: Set<String> = emptySet()
     private var activeTab: TabCategory = TabCategory.DONT_FOLLOW_BACK
     private var searchQuery: String = ""
@@ -98,15 +109,8 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
     val showSplash: StateFlow<Boolean> = _showSplash.asStateFlow()
 
     private var executorJob: Job? = null
-    private var syncJob: Job? = null
+    private var syncTimeoutJob: Job? = null
     private var calculationJob: Job? = null
-
-    companion object {
-        private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
-        private const val IG_APP_ID = "936619743392459"
-        private const val HASH_FOLLOWERS = "c76146de99bb02f6415203be841dd25a"
-        private const val HASH_FOLLOWING = "d04b0a864b4b54837c0d870b0e77e076"
-    }
 
     init {
         loadInitialData()
@@ -117,12 +121,19 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
         var following = prefs.getFollowing()
         rawRecent = prefs.getRecentActivity()
         rawWhitelist = prefs.getWhitelist()
+        originalFollowersCount = prefs.getExpectedFollowersCount()
+        originalFollowingCount = prefs.getExpectedFollowingCount()
 
         if (followers.isEmpty() && following.isEmpty()) {
             val (sampleFollowers, sampleFollowing) = prefs.loadSampleData()
             followers = sampleFollowers
             following = sampleFollowing
             rawWhitelist = setOf("1006")
+            originalFollowersCount = 1641
+            originalFollowingCount = 1859
+        } else {
+            if (originalFollowersCount == 0) originalFollowersCount = followers.size
+            if (originalFollowingCount == 0) originalFollowingCount = following.size
         }
 
         rawFollowers = followers
@@ -131,7 +142,9 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
         triggerStateCalculation()
     }
 
-    // High performance background calculation on Dispatchers.Default (120 FPS guarantee)
+    // ====================================================================
+    // O(1) SERVER-TRUTH RELATIONSHIP MATRIX ENGINE (Dispatched on Default)
+    // ====================================================================
     private fun triggerStateCalculation() {
         calculationJob?.cancel()
         calculationJob = viewModelScope.launch(Dispatchers.Default) {
@@ -139,55 +152,102 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
             val following = rawFollowing
             val recent = rawRecent
             val whitelist = rawWhitelist
+            val statuses = rawFriendshipStatuses
 
-            // Fast HashSet lookups
-            val followerPks = followers.mapTo(HashSet(followers.size * 2)) { it.pk.trim() }
-            val followerNames = followers.mapTo(HashSet(followers.size * 2)) { it.username.trim().lowercase() }
-            val followingPks = following.mapTo(HashSet(following.size * 2)) { it.pk.trim() }
-            val followingNames = following.mapTo(HashSet(following.size * 2)) { it.username.trim().lowercase() }
-            val whitelistNames = whitelist.mapTo(HashSet(whitelist.size * 2)) { it.trim().lowercase() }
-
-            fun isInFollowers(u: IGUser): Boolean =
-                followerPks.contains(u.pk.trim()) || followerNames.contains(u.username.trim().lowercase())
-
-            fun isInFollowing(u: IGUser): Boolean =
-                followingPks.contains(u.pk.trim()) || followingNames.contains(u.username.trim().lowercase())
-
-            val notFollowingBack = following.filter {
-                !isInFollowers(it) && !whitelist.contains(it.pk.trim()) && !whitelistNames.contains(it.username.trim().lowercase())
+            // Normalized lookup key sets (PK + lowercase username) as solid fallback
+            val followerKeySet = HashSet<String>(followers.size * 2).apply {
+                followers.forEach {
+                    if (it.pk.isNotBlank()) add("pk:${it.pk.trim()}")
+                    if (it.username.isNotBlank()) add("un:${it.username.trim().lowercase()}")
+                }
             }
 
-            val loyalFans = followers.filter {
-                !isInFollowing(it) && !whitelist.contains(it.pk.trim()) && !whitelistNames.contains(it.username.trim().lowercase())
+            val followingKeySet = HashSet<String>(following.size * 2).apply {
+                following.forEach {
+                    if (it.pk.isNotBlank()) add("pk:${it.pk.trim()}")
+                    if (it.username.isNotBlank()) add("un:${it.username.trim().lowercase()}")
+                }
             }
 
-            val mutuals = following.filter { isInFollowers(it) }
+            val whitelistSet = whitelist.map { it.trim().lowercase() }.toHashSet()
 
+            fun isUserInSet(u: IGUser, set: HashSet<String>): Boolean {
+                return (u.pk.isNotBlank() && set.contains("pk:${u.pk.trim()}")) ||
+                        (u.username.isNotBlank() && set.contains("un:${u.username.trim().lowercase()}"))
+            }
+
+            // 1. MUTUAL CONNECTIONS (mutuals)
+            // Primary ground truth: status.following && status.followed_by
+            // Fallback: user in followerKeySet
+            val mutualConnections = following.filter { user ->
+                val st = statuses[user.pk]
+                if (st != null) {
+                    st.following && st.followedBy
+                } else {
+                    isUserInSet(user, followerKeySet)
+                }
+            }
+
+            // 2. NOT FOLLOWING BACK / TRAITORS (notFollowingBack)
+            // Primary ground truth: status.following && !status.followed_by
+            // Fallback: !isUserInSet(user, followerKeySet)
+            val notFollowingBack = following.filter { user ->
+                val isWhitelisted = whitelist.contains(user.pk) || whitelistSet.contains(user.username.trim().lowercase())
+                if (isWhitelisted) return@filter false
+                val st = statuses[user.pk]
+                if (st != null) {
+                    st.following && !st.followedBy
+                } else {
+                    !isUserInSet(user, followerKeySet)
+                }
+            }
+
+            // 3. LOYAL FOLLOWERS / FANS TO FOLLOW BACK (loyalFollowers)
+            // Primary ground truth: status.followed_by && !status.following && !status.outgoing_request
+            // Fallback: !isUserInSet(user, followingKeySet)
+            val loyalFollowers = followers.filter { user ->
+                val isWhitelisted = whitelist.contains(user.pk) || whitelistSet.contains(user.username.trim().lowercase())
+                if (isWhitelisted) return@filter false
+                val st = statuses[user.pk]
+                if (st != null) {
+                    st.followedBy && !st.following && !st.outgoingRequest
+                } else {
+                    !isUserInSet(user, followingKeySet)
+                }
+            }
+
+            // 4. Whitelisted
             val whitelisted = (following + followers).distinctBy { it.pk.trim() }.filter {
-                whitelist.contains(it.pk.trim()) || whitelistNames.contains(it.username.trim().lowercase())
+                whitelist.contains(it.pk.trim()) || whitelistSet.contains(it.username.trim().lowercase())
             }
 
-            // Accurate Telemetry using Double division (guarantees no integer truncation!)
-            val reciprocity = if (following.isNotEmpty()) {
-                (mutuals.size.toDouble() / following.size.toDouble()) * 100.0
+            // Telemetry Bar Math with Double division (No integer truncation!)
+            val totalFol = if (originalFollowersCount > 0) originalFollowersCount else followers.size
+            val totalFing = if (originalFollowingCount > 0) originalFollowingCount else following.size
+
+            val reciprocity = if (totalFing > 0) {
+                (mutualConnections.size.toDouble() / totalFing.toDouble()) * 100.0
             } else 0.0
             val reciprocityPercent = String.format(Locale.US, "%.1f", reciprocity)
 
-            val followerRatio = if (following.isNotEmpty()) {
-                followers.size.toDouble() / following.size.toDouble()
+            val followerRatio = if (totalFing > 0) {
+                totalFol.toDouble() / totalFing.toDouble()
             } else 0.0
             val followerRatioStr = String.format(Locale.US, "%.2f", followerRatio)
 
-            // Select active tab list
+            val prevFol = prefs.getPreviousFollowersCount()
+            val netDelta = if (prevFol > 0) totalFol - prevFol else 0
+
+            // Active Tab Selection
             val targetList = when (activeTab) {
                 TabCategory.DONT_FOLLOW_BACK -> notFollowingBack
-                TabCategory.FANS -> loyalFans
+                TabCategory.FANS -> loyalFollowers
                 TabCategory.RECENTS -> recent
-                TabCategory.MUTUALS -> mutuals
+                TabCategory.MUTUALS -> mutualConnections
                 TabCategory.WHITELISTED -> whitelisted
             }
 
-            // Filter
+            // Search Filter
             var filtered = targetList
             if (searchQuery.isNotBlank()) {
                 val q = searchQuery.trim().lowercase()
@@ -196,6 +256,7 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
                 }
             }
 
+            // Sub-filters
             when (subFilter) {
                 SubFilter.ALL -> {}
                 SubFilter.VERIFIED -> filtered = filtered.filter { it.isVerified }
@@ -212,18 +273,20 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
                 SortOrder.AGE_OLD -> filtered.sortedBy { it.pk.toLongOrNull() ?: 0L }
             }
 
+            val followingPks = following.mapTo(HashSet(following.size * 2)) { it.pk.trim() }
+
             val newState = DashboardUiState(
                 displayedUsers = sorted,
-                totalFollowersCount = followers.size,
-                totalFollowingCount = following.size,
+                originalFollowersCount = totalFol,
+                originalFollowingCount = totalFing,
                 notFollowingBackCount = notFollowingBack.size,
-                fansCount = loyalFans.size,
-                mutualsCount = mutuals.size,
+                fansCount = loyalFollowers.size,
+                mutualsCount = mutualConnections.size,
                 recentsCount = recent.size,
                 whitelistedCount = whitelisted.size,
                 reciprocityPercent = reciprocityPercent,
                 followerRatioStr = followerRatioStr,
-                netDelta = 0,
+                netDelta = netDelta,
                 activeTab = activeTab,
                 searchQuery = searchQuery,
                 subFilter = subFilter,
@@ -248,561 +311,198 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    fun finishSplash() {
-        _showSplash.value = false
+    // ====================================================================
+    // INSTA WEBVIEW BRIDGE CALLBACKS
+    // ====================================================================
+    override fun onProfileTotals(followersCount: Int, followingCount: Int, username: String, avatarUrl: String) {
+        if (followersCount > 0) originalFollowersCount = followersCount
+        if (followingCount > 0) originalFollowingCount = followingCount
+        prefs.saveProfileInfo(username, avatarUrl, originalFollowersCount, originalFollowingCount)
+        triggerStateCalculation()
     }
 
-    fun openLoginModal() {
-        _showLoginModal.value = true
+    override fun onSyncProgress(phase: String, loadedFollowers: Int, expectedFollowers: Int, loadedFollowing: Int, expectedFollowing: Int, progressFraction: Float) {
+        syncPhaseTitle = phase
+        syncCounterText = phase
+        syncProgressFraction = progressFraction
+        triggerStateCalculation()
     }
 
-    fun closeLoginModal() {
-        _showLoginModal.value = false
-    }
+    override fun onSyncCompleted(followersJson: String, followingJson: String, friendshipStatusesJson: String) {
+        viewModelScope.launch(Dispatchers.Default) {
+            val parsedFollowers = parseUsersJson(followersJson)
+            val parsedFollowing = parseUsersJson(followingJson)
+            val parsedStatuses = parseFriendshipStatuses(friendshipStatusesJson)
 
-    private fun extractCookieValue(cookies: String, key: String): String? {
-        val prefix = "$key="
-        for (part in cookies.split(";")) {
-            val trimmed = part.trim()
-            if (trimmed.startsWith(prefix)) {
-                return trimmed.substring(prefix.length).trim()
+            if (parsedFollowers.isNotEmpty()) {
+                rawFollowers = parsedFollowers
+                prefs.saveFollowersImmediate(parsedFollowers)
             }
+            if (parsedFollowing.isNotEmpty()) {
+                rawFollowing = parsedFollowing
+                prefs.saveFollowingImmediate(parsedFollowing)
+            }
+            if (parsedStatuses.isNotEmpty()) {
+                rawFriendshipStatuses = parsedStatuses
+            }
+
+            val now = System.currentTimeMillis()
+            prefs.setLastSyncTime(now)
+            prefs.savePreviousFollowersCount(originalFollowersCount)
+
+            syncProgressFraction = 1f
+            syncPhaseTitle = "Sync Complete!"
+            syncCounterText = "100% Graph & Server Truth Reconciled (${rawFollowers.size} followers, ${rawFollowing.size} following)"
+            delay(350)
+
+            isSyncing = false
+            triggerStateCalculation()
         }
-        return null
     }
 
-    fun onLoginSuccess(cookieHeader: String, dsUserId: String = "", csrfToken: String = "") {
-        val resolvedDsUserId = dsUserId.ifEmpty { extractCookieValue(cookieHeader, "ds_user_id") ?: "" }
-        val resolvedCsrfToken = csrfToken.ifEmpty { extractCookieValue(cookieHeader, "csrftoken") ?: "" }
-
-        prefs.saveAuth(cookieHeader, resolvedDsUserId, resolvedCsrfToken)
-        _showLoginModal.value = false
-        triggerStateCalculation()
-
-        startLiveSync()
-    }
-
-    fun logout() {
-        syncJob?.cancel()
-        executorJob?.cancel()
-        prefs.clearAll()
-        rawFollowers = emptyList()
-        rawFollowing = emptyList()
-        rawRecent = emptyList()
-        rawWhitelist = emptySet()
-        checkedPks = emptySet()
-        triggerStateCalculation()
-        _executorState.value = ExecutorUiState()
-    }
-
-    fun loadSampleData() {
-        val (sampleFollowers, sampleFollowing) = prefs.loadSampleData()
-        rawFollowers = sampleFollowers
-        rawFollowing = sampleFollowing
-        rawRecent = emptyList()
-        rawWhitelist = setOf("1006")
-        checkedPks = emptySet()
+    override fun onSyncError(errorMsg: String) {
+        isSyncing = false
         triggerStateCalculation()
     }
 
-    fun setActiveTab(tab: TabCategory) {
-        activeTab = tab
-        triggerStateCalculation()
-    }
-
-    fun setSearchQuery(query: String) {
-        searchQuery = query
-        triggerStateCalculation()
-    }
-
-    fun setSubFilter(filter: SubFilter) {
-        subFilter = filter
-        triggerStateCalculation()
-    }
-
-    fun cycleSortOrder() {
-        val orders = SortOrder.values()
-        val currentIdx = orders.indexOf(sortOrder)
-        sortOrder = orders[(currentIdx + 1) % orders.size]
-        triggerStateCalculation()
-    }
-
-    fun toggleCheck(pk: String) {
-        val current = checkedPks.toMutableSet()
-        if (current.contains(pk)) {
-            current.remove(pk)
-        } else {
-            current.add(pk)
+    override fun onActionResult(pk: String, actionType: String, success: Boolean) {
+        viewModelScope.launch(Dispatchers.Default) {
+            val action = if (actionType == "UNFOLLOW") ActionType.UNFOLLOW else ActionType.FOLLOW
+            val item = ActionQueueItem(pk = pk, username = pk, action = action)
+            applyActionResultInMemory(item)
+            busyPk = null
+            triggerStateCalculation()
         }
-        checkedPks = current
-        triggerStateCalculation()
     }
 
-    fun selectAllVisible(pks: List<String>) {
-        checkedPks = pks.toSet()
-        triggerStateCalculation()
+    private fun parseUsersJson(jsonStr: String): List<IGUser> {
+        val list = mutableListOf<IGUser>()
+        try {
+            val arr = JSONArray(jsonStr)
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val pk = obj.optString("pk", "").trim()
+                if (pk.isNotEmpty()) {
+                    list.add(
+                        IGUser(
+                            pk = pk,
+                            username = obj.optString("username", "").trim().lowercase(),
+                            fullName = obj.optString("fullName", ""),
+                            profilePicUrl = obj.optString("profilePicUrl", ""),
+                            isVerified = obj.optBoolean("isVerified", false),
+                            isPrivate = obj.optBoolean("isPrivate", false)
+                        )
+                    )
+                }
+            }
+        } catch (_: Exception) {}
+        return list
     }
 
-    fun clearChecked() {
-        checkedPks = emptySet()
-        triggerStateCalculation()
-    }
-
-    fun toggleWhitelist(pk: String) {
-        val current = rawWhitelist.toMutableSet()
-        if (current.contains(pk)) {
-            current.remove(pk)
-        } else {
-            current.add(pk)
-        }
-        rawWhitelist = current
-        prefs.saveWhitelist(current)
-        triggerStateCalculation()
+    private fun parseFriendshipStatuses(jsonStr: String): Map<String, FriendshipStatus> {
+        val map = mutableMapOf<String, FriendshipStatus>()
+        try {
+            val obj = JSONObject(jsonStr)
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val pk = keys.next()
+                val st = obj.optJSONObject(pk)
+                if (st != null) {
+                    map[pk] = FriendshipStatus(
+                        following = st.optBoolean("following", false) || st.optBoolean("outgoing_request", false),
+                        followedBy = st.optBoolean("followed_by", false),
+                        outgoingRequest = st.optBoolean("outgoing_request", false)
+                    )
+                }
+            }
+        } catch (_: Exception) {}
+        return map
     }
 
     // ====================================================================
-    // DUAL-FALLBACK PAGINATED GRAPH SYNC ENGINE WITH RETRY & RECOVERY
+    // SYNC TRIGGER & ACTIONS
     // ====================================================================
     fun startLiveSync() {
         if (isSyncing) return
-        val cookieHeader = prefs.getCookieHeader()
         val dsUserId = prefs.getDsUserId()
         val csrfToken = prefs.getCsrfToken()
 
         isSyncing = true
-        syncPhaseTitle = "Initializing Sync Engine..."
-        syncCounterText = "Connecting securely to Instagram..."
+        syncPhaseTitle = "Stage 1/3: Scanning Followers Graph (0 / $originalFollowersCount)..."
+        syncCounterText = "Stage 1/3: Scanning Followers Graph (0 / $originalFollowersCount)..."
         syncProgressFraction = 0.05f
         triggerStateCalculation()
 
-        syncJob?.cancel()
-        syncJob = viewModelScope.launch(Dispatchers.IO) {
-            try {
-                if (!cookieHeader.isNullOrEmpty() && !dsUserId.isNullOrEmpty() && !csrfToken.isNullOrEmpty()) {
-                    // Step A: Fetch Official Profile Totals First
-                    val profileInfo = fetchUserProfileInfo(dsUserId, cookieHeader, csrfToken)
-                    val expectedFollowers = profileInfo.first.coerceAtLeast(rawFollowers.size)
-                    val expectedFollowing = profileInfo.second.coerceAtLeast(rawFollowing.size)
+        if (!dsUserId.isNullOrEmpty() && !csrfToken.isNullOrEmpty()) {
+            webViewBridge.startSync(dsUserId, csrfToken)
 
-                    // Step B - Phase 1: Fetch Followers
-                    syncPhaseTitle = "Phase 1/3: Fetching Followers..."
-                    syncCounterText = "0 / $expectedFollowers Followers (0%)"
-                    syncProgressFraction = 0.10f
-                    triggerStateCalculation()
-
-                    val followersMap = fetchGraphEdgeDual(
-                        userId = dsUserId,
-                        edgeType = "followers",
-                        expectedCount = expectedFollowers,
-                        queryHash = HASH_FOLLOWERS,
-                        cookieHeader = cookieHeader,
-                        csrfToken = csrfToken
-                    ) { count ->
-                        val pct = if (expectedFollowers > 0) (count * 100 / expectedFollowers).coerceAtMost(100) else 0
-                        syncCounterText = "$count / $expectedFollowers Followers ($pct%)"
-                        syncProgressFraction = 0.10f + (count.toFloat() / expectedFollowers.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f) * 0.35f
-                        triggerStateCalculation()
-                    }
-
-                    // Step B - Phase 2: Fetch Following
-                    syncPhaseTitle = "Phase 2/3: Fetching Following..."
-                    syncCounterText = "0 / $expectedFollowing Following (0%)"
-                    syncProgressFraction = 0.45f
-                    triggerStateCalculation()
-
-                    val followingMap = fetchGraphEdgeDual(
-                        userId = dsUserId,
-                        edgeType = "following",
-                        expectedCount = expectedFollowing,
-                        queryHash = HASH_FOLLOWING,
-                        cookieHeader = cookieHeader,
-                        csrfToken = csrfToken
-                    ) { count ->
-                        val pct = if (expectedFollowing > 0) (count * 100 / expectedFollowing).coerceAtMost(100) else 0
-                        syncCounterText = "$count / $expectedFollowing Following ($pct%)"
-                        syncProgressFraction = 0.45f + (count.toFloat() / expectedFollowing.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f) * 0.40f
-                        triggerStateCalculation()
-                    }
-
-                    // Step B - Phase 3: Graph Calculation & Verification Pass
-                    syncPhaseTitle = "Phase 3/3: Calculating Graph & Verifying..."
-                    syncCounterText = "Verifying relationship truth with show_many..."
-                    syncProgressFraction = 0.90f
-                    triggerStateCalculation()
-
-                    if (followersMap.isNotEmpty() && followingMap.isNotEmpty()) {
-                        verifyRelationshipTruth(
-                            followersMap = followersMap,
-                            followingMap = followingMap,
-                            cookieHeader = cookieHeader,
-                            csrfToken = csrfToken
-                        )
-                    }
-
-                    // Safety Guard: NEVER overwrite valid cache with 0 items
-                    val finalFollowers = if (followersMap.isNotEmpty()) followersMap.values.toList() else rawFollowers
-                    val finalFollowing = if (followingMap.isNotEmpty()) followingMap.values.toList() else rawFollowing
-
-                    rawFollowers = finalFollowers
-                    rawFollowing = finalFollowing
-
-                    prefs.saveFollowersImmediate(finalFollowers)
-                    prefs.saveFollowingImmediate(finalFollowing)
-                    val now = System.currentTimeMillis()
-                    prefs.setLastSyncTime(now)
-
-                    syncProgressFraction = 1f
-                    syncPhaseTitle = "Sync Complete!"
-                    syncCounterText = "100% graph loaded (${finalFollowers.size} followers, ${finalFollowing.size} following)"
-                    delay(400)
-
-                    isSyncing = false
-                    triggerStateCalculation()
-                } else {
-                    // Demo offline simulation
-                    syncPhaseTitle = "Phase 1/3: Fetching Followers..."
-                    syncCounterText = "Loading offline sample data..."
-                    syncProgressFraction = 0.35f
-                    triggerStateCalculation()
-                    delay(500)
-
-                    syncPhaseTitle = "Phase 2/3: Fetching Following..."
-                    syncProgressFraction = 0.70f
-                    triggerStateCalculation()
-                    delay(500)
-
-                    syncPhaseTitle = "Phase 3/3: Reconciling Relationships..."
-                    syncProgressFraction = 1f
-                    triggerStateCalculation()
-                    delay(300)
-
+            // Safety guard timeout: 120s
+            syncTimeoutJob?.cancel()
+            syncTimeoutJob = viewModelScope.launch {
+                delay(120000)
+                if (isSyncing) {
                     isSyncing = false
                     triggerStateCalculation()
                 }
-            } catch (e: Exception) {
+            }
+        } else {
+            // Realistic offline demo simulation with Server Truth
+            viewModelScope.launch {
+                delay(400)
+                syncPhaseTitle = "Stage 1/3: Scanning Followers Graph (820 / $originalFollowersCount)..."
+                syncCounterText = syncPhaseTitle
+                syncProgressFraction = 0.20f
+                triggerStateCalculation()
+                delay(400)
+
+                syncPhaseTitle = "Stage 1/3: Scanning Followers Graph ($originalFollowersCount / $originalFollowersCount)..."
+                syncCounterText = syncPhaseTitle
+                syncProgressFraction = 0.40f
+                triggerStateCalculation()
+                delay(400)
+
+                syncPhaseTitle = "Stage 2/3: Scanning Following Graph (920 / $originalFollowingCount)..."
+                syncCounterText = syncPhaseTitle
+                syncProgressFraction = 0.60f
+                triggerStateCalculation()
+                delay(400)
+
+                syncPhaseTitle = "Stage 2/3: Scanning Following Graph ($originalFollowingCount / $originalFollowingCount)..."
+                syncCounterText = syncPhaseTitle
+                syncProgressFraction = 0.80f
+                triggerStateCalculation()
+                delay(400)
+
+                syncPhaseTitle = "Stage 3/3: Verifying Mutuals & Fans via Server Matrix (50%)..."
+                syncCounterText = syncPhaseTitle
+                syncProgressFraction = 0.90f
+                triggerStateCalculation()
+                delay(400)
+
+                syncPhaseTitle = "Stage 3/3: Verifying Mutuals & Fans via Server Matrix (100%)..."
+                syncCounterText = syncPhaseTitle
+                syncProgressFraction = 1f
+                triggerStateCalculation()
+                delay(300)
+
+                // Build simulated server truth statuses for sample data
+                val simulatedStatuses = mutableMapOf<String, FriendshipStatus>()
+                val mutualPks = setOf("1004", "1005", "1006", "1007", "1009", "1010", "1011", "1012", "1013", "1014", "1015")
+                val fanPks = setOf("2001", "2002")
+                val traitorPks = setOf("1001", "1002", "1003", "1008")
+
+                mutualPks.forEach { simulatedStatuses[it] = FriendshipStatus(following = true, followedBy = true) }
+                fanPks.forEach { simulatedStatuses[it] = FriendshipStatus(following = false, followedBy = true) }
+                traitorPks.forEach { simulatedStatuses[it] = FriendshipStatus(following = true, followedBy = false) }
+
+                rawFriendshipStatuses = simulatedStatuses
                 isSyncing = false
+                prefs.setLastSyncTime(System.currentTimeMillis())
                 triggerStateCalculation()
             }
         }
     }
 
-    // Step A: Fetch Official Profile Totals
-    private fun fetchUserProfileInfo(
-        userId: String,
-        cookieHeader: String,
-        csrfToken: String
-    ): Pair<Int, Int> {
-        return try {
-            val url = URL("https://www.instagram.com/api/v1/users/$userId/info/")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 8000
-            conn.readTimeout = 8000
-            conn.setRequestProperty("User-Agent", USER_AGENT)
-            conn.setRequestProperty("Cookie", cookieHeader)
-            conn.setRequestProperty("x-ig-app-id", IG_APP_ID)
-            conn.setRequestProperty("x-csrftoken", csrfToken)
-            conn.setRequestProperty("x-requested-with", "XMLHttpRequest")
-            conn.setRequestProperty("Referer", "https://www.instagram.com/")
-
-            if (conn.responseCode in 200..299) {
-                val body = conn.inputStream.bufferedReader().use { it.readText() }
-                val json = JSONObject(body)
-                val user = json.optJSONObject("user")
-                if (user != null) {
-                    val followersCount = user.optInt("follower_count", 0)
-                    val followingCount = user.optInt("following_count", 0)
-                    val username = user.optString("username", "")
-                    val avatarUrl = user.optString("profile_pic_url", "")
-                    prefs.saveProfileInfo(username, avatarUrl, followersCount, followingCount)
-                    return Pair(followersCount, followingCount)
-                }
-            }
-            Pair(prefs.getExpectedFollowersCount(), prefs.getExpectedFollowingCount())
-        } catch (_: Exception) {
-            Pair(prefs.getExpectedFollowersCount(), prefs.getExpectedFollowingCount())
-        }
-    }
-
-    // Step B: Dual-Fallback Graph Sync (REST primary, GraphQL fallback, 4x retry)
-    private suspend fun fetchGraphEdgeDual(
-        userId: String,
-        edgeType: String,
-        expectedCount: Int,
-        queryHash: String,
-        cookieHeader: String,
-        csrfToken: String,
-        onProgress: (Int) -> Unit
-    ): LinkedHashMap<String, IGUser> = withContext(Dispatchers.IO) {
-        val usersMap = LinkedHashMap<String, IGUser>()
-        var nextMaxId: String? = null
-        var hasNext = true
-        var consecutiveErrors = 0
-        var useGraphQLFallback = false
-
-        while (hasNext && consecutiveErrors < 4) {
-            if (!useGraphQLFallback) {
-                // Primary REST approach
-                val pageResult = fetchRestPageWithRetry(userId, edgeType, nextMaxId, cookieHeader, csrfToken)
-                if (pageResult != null && pageResult.users.isNotEmpty()) {
-                    consecutiveErrors = 0
-                    for (u in pageResult.users) {
-                        usersMap[u.pk] = u
-                    }
-                    onProgress(usersMap.size)
-
-                    if (!pageResult.nextCursor.isNullOrEmpty() && pageResult.nextCursor != "null") {
-                        nextMaxId = pageResult.nextCursor
-                        delay(250)
-                    } else {
-                        // Check if we reached expected count; if significantly short, try GraphQL
-                        if (expectedCount > 0 && usersMap.size < expectedCount * 0.7) {
-                            useGraphQLFallback = true
-                            nextMaxId = null
-                        } else {
-                            hasNext = false
-                        }
-                    }
-                } else {
-                    // Switch to GraphQL fallback
-                    useGraphQLFallback = true
-                    nextMaxId = null
-                }
-            }
-
-            if (useGraphQLFallback && hasNext) {
-                val gqlResult = fetchGraphQLPageWithRetry(userId, queryHash, edgeType, nextMaxId, cookieHeader, csrfToken)
-                if (gqlResult != null && gqlResult.users.isNotEmpty()) {
-                    consecutiveErrors = 0
-                    for (u in gqlResult.users) {
-                        usersMap[u.pk] = u
-                    }
-                    onProgress(usersMap.size)
-
-                    if (gqlResult.hasNextPage && !gqlResult.nextCursor.isNullOrEmpty()) {
-                        nextMaxId = gqlResult.nextCursor
-                        delay(350)
-                    } else {
-                        hasNext = false
-                    }
-                } else {
-                    consecutiveErrors++
-                    delay((consecutiveErrors * 1000L).coerceAtMost(3500L))
-                }
-            }
-        }
-
-        usersMap
-    }
-
-    private data class PageResult(
-        val users: List<IGUser>,
-        val nextCursor: String?,
-        val hasNextPage: Boolean = false
-    )
-
-    private fun fetchRestPageWithRetry(
-        userId: String,
-        edgeType: String,
-        cursor: String?,
-        cookieHeader: String,
-        csrfToken: String
-    ): PageResult? {
-        val backoffs = listOf(0L, 1000L, 2000L, 3500L)
-        for (attempt in 0..3) {
-            if (attempt > 0) Thread.sleep(backoffs[attempt])
-            try {
-                val urlStr = StringBuilder("https://www.instagram.com/api/v1/friendships/$userId/$edgeType/?count=50")
-                if (!cursor.isNullOrEmpty()) {
-                    urlStr.append("&max_id=").append(URLEncoder.encode(cursor, "UTF-8"))
-                }
-                val url = URL(urlStr.toString())
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 10000
-                conn.readTimeout = 10000
-                conn.setRequestProperty("User-Agent", USER_AGENT)
-                conn.setRequestProperty("Cookie", cookieHeader)
-                conn.setRequestProperty("x-ig-app-id", IG_APP_ID)
-                conn.setRequestProperty("x-csrftoken", csrfToken)
-                conn.setRequestProperty("x-requested-with", "XMLHttpRequest")
-                conn.setRequestProperty("Referer", "https://www.instagram.com/")
-
-                val code = conn.responseCode
-                if (code in 200..299) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val json = JSONObject(body)
-                    val usersArr = json.optJSONArray("users")
-                    val parsed = mutableListOf<IGUser>()
-                    if (usersArr != null) {
-                        for (i in 0 until usersArr.length()) {
-                            val u = usersArr.getJSONObject(i)
-                            val pk = u.optString("pk", u.optString("id")).trim()
-                            if (pk.isNotEmpty()) {
-                                parsed.add(
-                                    IGUser(
-                                        pk = pk,
-                                        username = u.optString("username").trim().lowercase(),
-                                        fullName = u.optString("full_name", ""),
-                                        profilePicUrl = u.optString("profile_pic_url", ""),
-                                        isVerified = u.optBoolean("is_verified", false),
-                                        isPrivate = u.optBoolean("is_private", false)
-                                    )
-                                )
-                            }
-                        }
-                    }
-                    val nextCursor = if (json.has("next_max_id") && !json.isNull("next_max_id")) {
-                        json.optString("next_max_id")
-                    } else null
-
-                    return PageResult(parsed, nextCursor, nextCursor != null)
-                }
-            } catch (_: Exception) {}
-        }
-        return null
-    }
-
-    private fun fetchGraphQLPageWithRetry(
-        userId: String,
-        queryHash: String,
-        edgeType: String,
-        cursor: String?,
-        cookieHeader: String,
-        csrfToken: String
-    ): PageResult? {
-        val backoffs = listOf(0L, 1000L, 2000L, 3500L)
-        for (attempt in 0..3) {
-            if (attempt > 0) Thread.sleep(backoffs[attempt])
-            try {
-                val vars = if (cursor.isNullOrEmpty()) {
-                    "{\"id\":\"$userId\",\"include_reel\":false,\"fetch_mutual\":false,\"first\":50}"
-                } else {
-                    "{\"id\":\"$userId\",\"include_reel\":false,\"fetch_mutual\":false,\"first\":50,\"after\":\"$cursor\"}"
-                }
-                val urlStr = "https://www.instagram.com/graphql/query/?query_hash=$queryHash&variables=" + URLEncoder.encode(vars, "UTF-8")
-                val url = URL(urlStr)
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 10000
-                conn.readTimeout = 10000
-                conn.setRequestProperty("User-Agent", USER_AGENT)
-                conn.setRequestProperty("Cookie", cookieHeader)
-                conn.setRequestProperty("x-ig-app-id", IG_APP_ID)
-                conn.setRequestProperty("x-csrftoken", csrfToken)
-                conn.setRequestProperty("x-requested-with", "XMLHttpRequest")
-                conn.setRequestProperty("Referer", "https://www.instagram.com/")
-
-                if (conn.responseCode in 200..299) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val json = JSONObject(body)
-                    val data = json.optJSONObject("data") ?: continue
-                    val user = data.optJSONObject("user") ?: continue
-                    val edgeObj = if (edgeType == "followers") {
-                        user.optJSONObject("edge_followed_by")
-                    } else {
-                        user.optJSONObject("edge_follow")
-                    } ?: continue
-
-                    val edges = edgeObj.optJSONArray("edges")
-                    val parsed = mutableListOf<IGUser>()
-                    if (edges != null) {
-                        for (i in 0 until edges.length()) {
-                            val node = edges.getJSONObject(i).optJSONObject("node") ?: continue
-                            val pk = node.optString("id").trim()
-                            if (pk.isNotEmpty()) {
-                                parsed.add(
-                                    IGUser(
-                                        pk = pk,
-                                        username = node.optString("username").trim().lowercase(),
-                                        fullName = node.optString("full_name", ""),
-                                        profilePicUrl = node.optString("profile_pic_url", ""),
-                                        isVerified = node.optBoolean("is_verified", false),
-                                        isPrivate = node.optBoolean("is_private", false)
-                                    )
-                                )
-                            }
-                        }
-                    }
-
-                    val pageInfo = edgeObj.optJSONObject("page_info")
-                    val endCursor = pageInfo?.optString("end_cursor")
-                    val hasNextPage = pageInfo?.optBoolean("has_next_page", false) ?: false
-
-                    return PageResult(parsed, endCursor, hasNextPage)
-                }
-            } catch (_: Exception) {}
-        }
-        return null
-    }
-
-    private suspend fun verifyRelationshipTruth(
-        followersMap: LinkedHashMap<String, IGUser>,
-        followingMap: LinkedHashMap<String, IGUser>,
-        cookieHeader: String,
-        csrfToken: String
-    ) = withContext(Dispatchers.IO) {
-        val candidateIds = mutableListOf<String>()
-        for (pk in followersMap.keys) {
-            if (!followingMap.containsKey(pk)) candidateIds.add(pk)
-        }
-        for (pk in followingMap.keys) {
-            if (!followersMap.containsKey(pk) && !candidateIds.contains(pk)) candidateIds.add(pk)
-        }
-
-        for (chunk in candidateIds.chunked(100)) {
-            try {
-                val url = URL("https://www.instagram.com/api/v1/friendships/show_many/")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.doOutput = true
-                conn.connectTimeout = 10000
-                conn.readTimeout = 10000
-                conn.setRequestProperty("User-Agent", USER_AGENT)
-                conn.setRequestProperty("Cookie", cookieHeader)
-                conn.setRequestProperty("x-ig-app-id", IG_APP_ID)
-                conn.setRequestProperty("x-csrftoken", csrfToken)
-                conn.setRequestProperty("x-requested-with", "XMLHttpRequest")
-                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-
-                val body = "user_ids=" + chunk.joinToString(",")
-                conn.outputStream.use { it.write(body.toByteArray()) }
-
-                if (conn.responseCode in 200..299) {
-                    val resp = conn.inputStream.bufferedReader().use { it.readText() }
-                    val json = JSONObject(resp)
-                    val statuses = json.optJSONObject("friendship_statuses")
-                    if (statuses != null) {
-                        for (pk in chunk) {
-                            val status = statuses.optJSONObject(pk) ?: continue
-                            val isFollowing = status.optBoolean("following", false) || status.optBoolean("outgoing_request", false)
-                            val isFollowedBy = status.optBoolean("followed_by", false)
-
-                            if (isFollowing) {
-                                if (!followingMap.containsKey(pk) && followersMap.containsKey(pk)) {
-                                    followingMap[pk] = followersMap[pk]!!
-                                }
-                            } else {
-                                followingMap.remove(pk)
-                            }
-
-                            if (isFollowedBy) {
-                                if (!followersMap.containsKey(pk) && followingMap.containsKey(pk)) {
-                                    followersMap[pk] = followingMap[pk]!!
-                                }
-                            } else {
-                                followersMap.remove(pk)
-                            }
-                        }
-                    }
-                }
-            } catch (_: Exception) {}
-        }
-    }
-
-    // ====================================================================
-    // FAST BACKGROUND FOLLOW / UNFOLLOW (INSTANT UI UPDATE & DEBOUNCED DISK SAVE)
-    // ====================================================================
     fun startSingleAction(user: IGUser) {
         if (busyPk != null) return
 
@@ -813,17 +513,22 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
         busyPk = user.pk
         triggerStateCalculation()
 
-        viewModelScope.launch(Dispatchers.IO) {
-            val cookieHeader = prefs.getCookieHeader()
-            val csrfToken = prefs.getCsrfToken()
+        val csrfToken = prefs.getCsrfToken() ?: ""
+        if (csrfToken.isNotEmpty()) {
+            webViewBridge.executeAction(user.pk, action.name, csrfToken)
 
-            if (!cookieHeader.isNullOrEmpty() && !csrfToken.isNullOrEmpty()) {
-                performFriendshipAction(user.pk, action, cookieHeader, csrfToken)
-            } else {
-                delay(400)
+            // Safety timeout: 8s
+            viewModelScope.launch {
+                delay(8000)
+                if (busyPk == user.pk) {
+                    applyActionResultInMemory(item)
+                    busyPk = null
+                    triggerStateCalculation()
+                }
             }
-
-            withContext(Dispatchers.Default) {
+        } else {
+            viewModelScope.launch {
+                delay(350)
                 applyActionResultInMemory(item)
                 busyPk = null
                 triggerStateCalculation()
@@ -889,8 +594,7 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
     private fun runExecutorLoop() {
         executorJob?.cancel()
         executorJob = viewModelScope.launch {
-            val cookieHeader = prefs.getCookieHeader()
-            val csrfToken = prefs.getCsrfToken()
+            val csrfToken = prefs.getCsrfToken() ?: ""
 
             while (_executorState.value.currentIndex < _executorState.value.queue.size) {
                 if (_executorState.value.isPaused) break
@@ -904,13 +608,11 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
                     statusMessage = "Executing ${item.action.name.lowercase()} for @${item.username}..."
                 )
 
-                // Execute action in IO with 8s timeout
-                withContext(Dispatchers.IO) {
-                    if (!cookieHeader.isNullOrEmpty() && !csrfToken.isNullOrEmpty() && item.pk != null) {
-                        performFriendshipAction(item.pk, item.action, cookieHeader, csrfToken)
-                    } else {
-                        delay(450)
-                    }
+                if (csrfToken.isNotEmpty() && item.pk != null) {
+                    webViewBridge.executeAction(item.pk, item.action.name, csrfToken)
+                    delay(800)
+                } else {
+                    delay(350)
                 }
 
                 if (_executorState.value.isPaused) break
@@ -925,7 +627,7 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
                     statusMessage = "✅ Successfully $actionWord @${item.username}"
                 )
 
-                // Fast sequential queue pacing: 2.0s - 3.5s delay between users
+                // Sequential queue pacing: 2.0s - 3.5s delay
                 val isBatch = _executorState.value.queue.size > 1
                 if (isBatch && currentIndex + 1 < _executorState.value.queue.size) {
                     val pacingTotalMs = 2000L + Random.nextLong(1500L)
@@ -956,50 +658,6 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    private fun performFriendshipAction(
-        pk: String,
-        action: ActionType,
-        cookieHeader: String,
-        csrfToken: String
-    ): Boolean {
-        val endpoint = if (action == ActionType.UNFOLLOW) {
-            "https://www.instagram.com/api/v1/friendships/destroy/$pk/"
-        } else {
-            "https://www.instagram.com/api/v1/friendships/create/$pk/"
-        }
-        return try {
-            val url = URL(endpoint)
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.connectTimeout = 8000
-            conn.readTimeout = 8000
-            conn.setRequestProperty("User-Agent", USER_AGENT)
-            conn.setRequestProperty("Cookie", cookieHeader)
-            conn.setRequestProperty("x-ig-app-id", IG_APP_ID)
-            conn.setRequestProperty("x-csrftoken", csrfToken)
-            conn.setRequestProperty("x-requested-with", "XMLHttpRequest")
-            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-
-            conn.outputStream.use { os ->
-                os.write("".toByteArray())
-                os.flush()
-            }
-
-            val code = conn.responseCode
-            if (code in 200..299) {
-                val responseText = conn.inputStream.bufferedReader().use { it.readText() }
-                val json = JSONObject(responseText)
-                json.optString("status") == "ok"
-            } else {
-                // Auto-skip 404 or 400 cleanly
-                true
-            }
-        } catch (_: Exception) {
-            true
-        }
-    }
-
     private fun applyActionResultInMemory(item: ActionQueueItem) {
         val now = System.currentTimeMillis()
         val actionType = if (item.action == ActionType.UNFOLLOW) "unfollowed" else "followed"
@@ -1023,17 +681,164 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
         }
         prefs.saveRecentActivity(rawRecent)
 
-        // Update following list
+        // Update friendship status cache
+        val resolvedPk = item.pk ?: existingUser.pk
+        val currentSt = rawFriendshipStatuses[resolvedPk]
+        if (currentSt != null) {
+            val updatedSt = currentSt.copy(
+                following = item.action == ActionType.FOLLOW
+            )
+            rawFriendshipStatuses = rawFriendshipStatuses + (resolvedPk to updatedSt)
+        }
+
+        // Update following list & originalFollowingCount
         val currentFollowing = rawFollowing.toMutableList()
         if (item.action == ActionType.UNFOLLOW) {
             currentFollowing.removeAll { it.pk == item.pk || it.username == item.username }
+            originalFollowingCount = (originalFollowingCount - 1).coerceAtLeast(0)
+            prefs.updateFollowingCount(-1)
         } else {
             val exists = currentFollowing.any { it.pk == item.pk || it.username == item.username }
             if (!exists) {
                 currentFollowing.add(0, updatedUser)
+                originalFollowingCount += 1
+                prefs.updateFollowingCount(1)
             }
         }
         rawFollowing = currentFollowing
         prefs.saveFollowing(currentFollowing)
+    }
+
+    fun finishSplash() {
+        _showSplash.value = false
+    }
+
+    fun openLoginModal() {
+        _showLoginModal.value = true
+    }
+
+    fun closeLoginModal() {
+        _showLoginModal.value = false
+    }
+
+    private fun extractCookieValue(cookies: String, key: String): String? {
+        val prefix = "$key="
+        for (part in cookies.split(";")) {
+            val trimmed = part.trim()
+            if (trimmed.startsWith(prefix)) {
+                return trimmed.substring(prefix.length).trim()
+            }
+        }
+        return null
+    }
+
+    fun onLoginSuccess(cookieHeader: String, dsUserId: String = "", csrfToken: String = "") {
+        val resolvedDsUserId = dsUserId.ifEmpty { extractCookieValue(cookieHeader, "ds_user_id") ?: "" }
+        val resolvedCsrfToken = csrfToken.ifEmpty { extractCookieValue(cookieHeader, "csrftoken") ?: "" }
+
+        prefs.saveAuth(cookieHeader, resolvedDsUserId, resolvedCsrfToken)
+        _showLoginModal.value = false
+        triggerStateCalculation()
+
+        startLiveSync()
+    }
+
+    fun logout() {
+        executorJob?.cancel()
+        prefs.clearAll()
+        rawFollowers = emptyList()
+        rawFollowing = emptyList()
+        rawRecent = emptyList()
+        rawWhitelist = emptySet()
+        rawFriendshipStatuses = emptyMap()
+        checkedPks = emptySet()
+        originalFollowersCount = 0
+        originalFollowingCount = 0
+        triggerStateCalculation()
+        _executorState.value = ExecutorUiState()
+    }
+
+    fun loadSampleData() {
+        val (sampleFollowers, sampleFollowing) = prefs.loadSampleData()
+        rawFollowers = sampleFollowers
+        rawFollowing = sampleFollowing
+        rawRecent = emptyList()
+        rawWhitelist = setOf("1006")
+        checkedPks = emptySet()
+        originalFollowersCount = 1641
+        originalFollowingCount = 1859
+
+        // Realistic server truth statuses
+        val simulatedStatuses = mutableMapOf<String, FriendshipStatus>()
+        val mutualPks = setOf("1004", "1005", "1006", "1007", "1009", "1010", "1011", "1012", "1013", "1014", "1015")
+        val fanPks = setOf("2001", "2002")
+        val traitorPks = setOf("1001", "1002", "1003", "1008")
+
+        mutualPks.forEach { simulatedStatuses[it] = FriendshipStatus(following = true, followedBy = true) }
+        fanPks.forEach { simulatedStatuses[it] = FriendshipStatus(following = false, followedBy = true) }
+        traitorPks.forEach { simulatedStatuses[it] = FriendshipStatus(following = true, followedBy = false) }
+
+        rawFriendshipStatuses = simulatedStatuses
+        triggerStateCalculation()
+    }
+
+    fun setActiveTab(tab: TabCategory) {
+        activeTab = tab
+        triggerStateCalculation()
+    }
+
+    fun setSearchQuery(query: String) {
+        searchQuery = query
+        triggerStateCalculation()
+    }
+
+    fun setSubFilter(filter: SubFilter) {
+        subFilter = filter
+        triggerStateCalculation()
+    }
+
+    fun cycleSortOrder() {
+        val orders = SortOrder.values()
+        val currentIdx = orders.indexOf(sortOrder)
+        sortOrder = orders[(currentIdx + 1) % orders.size]
+        triggerStateCalculation()
+    }
+
+    fun toggleCheck(pk: String) {
+        val current = checkedPks.toMutableSet()
+        if (current.contains(pk)) {
+            current.remove(pk)
+        } else {
+            current.add(pk)
+        }
+        checkedPks = current
+        triggerStateCalculation()
+    }
+
+    fun selectAllVisible(pks: List<String>) {
+        checkedPks = pks.toSet()
+        triggerStateCalculation()
+    }
+
+    fun clearChecked() {
+        checkedPks = emptySet()
+        triggerStateCalculation()
+    }
+
+    fun toggleWhitelist(pk: String) {
+        val current = rawWhitelist.toMutableSet()
+        if (current.contains(pk)) {
+            current.remove(pk)
+        } else {
+            current.add(pk)
+        }
+        rawWhitelist = current
+        prefs.saveWhitelist(current)
+        triggerStateCalculation()
+    }
+
+    fun onTrimMemory(level: Int) {
+        webViewBridge.clearCache()
+        com.instapulse.data.image.AvatarMemoryCache.trimToSize(4 * 1024 * 1024)
     }
 }

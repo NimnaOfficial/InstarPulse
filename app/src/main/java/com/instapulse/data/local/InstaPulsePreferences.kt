@@ -42,6 +42,7 @@ class InstaPulsePreferences(context: Context) {
         private const val KEY_MY_AVATAR = "key_my_avatar"
         private const val KEY_TOTAL_FOLLOWERS = "key_total_followers"
         private const val KEY_TOTAL_FOLLOWING = "key_total_following"
+        private const val KEY_PREV_FOLLOWERS = "key_prev_followers"
     }
 
     fun saveAuth(cookieHeader: String, dsUserId: String, csrfToken: String) {
@@ -66,6 +67,17 @@ class InstaPulsePreferences(context: Context) {
     fun getMyAvatar(): String = prefs.getString(KEY_MY_AVATAR, "") ?: ""
     fun getExpectedFollowersCount(): Int = prefs.getInt(KEY_TOTAL_FOLLOWERS, 0)
     fun getExpectedFollowingCount(): Int = prefs.getInt(KEY_TOTAL_FOLLOWING, 0)
+
+    fun getPreviousFollowersCount(): Int = prefs.getInt(KEY_PREV_FOLLOWERS, 0)
+    fun savePreviousFollowersCount(count: Int) {
+        prefs.edit().putInt(KEY_PREV_FOLLOWERS, count).apply()
+    }
+
+    fun updateFollowingCount(delta: Int) {
+        val current = getExpectedFollowingCount()
+        val updated = (current + delta).coerceAtLeast(0)
+        prefs.edit().putInt(KEY_TOTAL_FOLLOWING, updated).apply()
+    }
 
     fun getCookieHeader(): String? = prefs.getString(KEY_COOKIE_HEADER, null)
     fun getDsUserId(): String? = prefs.getString(KEY_DS_USER_ID, null)
@@ -272,16 +284,17 @@ class InstaPulsePreferences(context: Context) {
         val sampleFollowers = listOf(
             IGUser("1004", "sarah_wanderlust", "Sarah Jenkins | Travel", "", isVerified = false, isPrivate = false),
             IGUser("1005", "alex_photos", "Alex Chen Photography", "", isVerified = false, isPrivate = false),
+            IGUser("1006", "urban_coffee_roasters", "Urban Coffee Roasters", "", isVerified = true, isPrivate = false),
+            IGUser("1007", "fitness_pro_mike", "Mike Sterling Fitness", "", isVerified = false, isPrivate = false),
             IGUser("1009", "maria_art_studio", "Maria Silva Studio", "", isVerified = false, isPrivate = false),
+            IGUser("1010", "startup_digest", "Startup & VC Wire", "", isVerified = true, isPrivate = false),
             IGUser("1011", "nature_escapes", "Epic Nature Escapes", "", isVerified = false, isPrivate = false),
+            IGUser("1012", "nordic_interior", "Nordic Living & Style", "", isVerified = false, isPrivate = false),
+            IGUser("1013", "david_beats", "David Kim Beats", "", isVerified = false, isPrivate = true),
+            IGUser("1014", "streetwear_daily", "Streetwear Archive", "", isVerified = true, isPrivate = false),
             IGUser("1015", "chef_marcus", "Chef Marcus Bell", "", isVerified = true, isPrivate = false),
             IGUser("2001", "emma_designer", "Emma Watson Design", "", isVerified = false, isPrivate = false),
-            IGUser("2002", "lucas_code", "Lucas dev", "", isVerified = false, isPrivate = true),
-            IGUser("2003", "neon_cyber", "Cyberpunk Vibes", "", isVerified = true, isPrivate = false),
-            IGUser("2004", "clara_reads", "Clara's Book Club", "", isVerified = false, isPrivate = false),
-            IGUser("2005", "kevin_runner", "Kevin Marathoner", "", isVerified = false, isPrivate = false),
-            IGUser("2006", "bella_foodie", "Bella Eats World", "", isVerified = false, isPrivate = false),
-            IGUser("2007", "sunset_captures", "Golden Hour Daily", "", isVerified = false, isPrivate = false)
+            IGUser("2002", "lucas_code", "Lucas dev", "", isVerified = false, isPrivate = true)
         )
 
         cachedFollowing = sampleFollowing
@@ -293,6 +306,9 @@ class InstaPulsePreferences(context: Context) {
                 .putString(KEY_FOLLOWING, serializeUsers(sampleFollowing))
                 .putString(KEY_FOLLOWERS, serializeUsers(sampleFollowers))
                 .putString(KEY_WHITELIST, JSONArray().put("1006").toString())
+                .putInt(KEY_TOTAL_FOLLOWERS, 1641)
+                .putInt(KEY_TOTAL_FOLLOWING, 1859)
+                .putString(KEY_MY_USERNAME, "alex_creator")
                 .putLong(KEY_LAST_SYNC_TIME, System.currentTimeMillis() - 180000)
                 .apply()
         }
