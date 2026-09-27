@@ -1,5 +1,8 @@
 package com.instapulse.data.model
 
+import androidx.compose.runtime.Immutable
+
+@Immutable
 data class IGUser(
     val pk: String,
     val username: String,

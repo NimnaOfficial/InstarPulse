@@ -2,157 +2,149 @@ package com.instapulse.ui.login
 
 import android.annotation.SuppressLint
 import android.graphics.Bitmap
+import android.view.ViewGroup
 import android.webkit.CookieManager
-import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import com.instapulse.ui.theme.CanvasBg
-import com.instapulse.ui.theme.Crimson
-import com.instapulse.ui.theme.Cyan
-import com.instapulse.ui.theme.TextPrimary
-import com.instapulse.ui.theme.TextSecondary
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun InstagramLoginDialog(
-    visible: Boolean,
+    visible: Boolean = true,
     onDismiss: () -> Unit,
-    onLoginSuccess: (dsUserId: String, csrfToken: String) -> Unit
+    onLoginSuccess: (cookieHeader: String, dsUserId: String, csrfToken: String) -> Unit
 ) {
     if (!visible) return
 
-    var isLoading by remember { mutableStateOf(true) }
     var statusText by remember { mutableStateOf("Connecting to Instagram...") }
+    var isLoadingPage by remember { mutableStateOf(true) }
+    var hasCompletedLogin by remember { mutableStateOf(false) }
 
     Dialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false
+        )
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(CanvasBg)
+                .background(Color(0xFF090A0F))
+                .systemBarsPadding()
         ) {
-            // Header Bar
+            // Top Header Bar
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                    .background(Color(0xFF12151F))
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "Instagram Authentication",
-                        color = TextPrimary,
+                        color = Color.White,
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
                         text = statusText,
-                        color = TextSecondary,
-                        fontSize = 11.sp
+                        color = Color(0xFF94A3B8),
+                        fontSize = 12.sp
                     )
                 }
-
-                if (isLoading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.padding(end = 12.dp),
-                        color = Cyan,
-                        strokeWidth = 2.dp
-                    )
-                }
-
                 TextButton(onClick = onDismiss) {
                     Text(
                         text = "Close",
-                        color = Crimson,
+                        color = Color(0xFFFF3B5C),
                         fontWeight = FontWeight.Bold
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(1.dp).fillMaxWidth().background(Color_0x14White))
+            if (isLoadingPage) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth().height(2.dp),
+                    color = Color(0xFFDD2A7B),
+                    trackColor = Color(0xFF12151F)
+                )
+            }
 
-            // WebView
-            Box(modifier = Modifier.weight(1f)) {
+            // Full-Screen Native Android WebView
+            Box(modifier = Modifier.fillMaxSize().weight(1f)) {
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { context ->
                         WebView(context).apply {
-                            val cookieManager = CookieManager.getInstance()
-                            cookieManager.setAcceptCookie(true)
-                            cookieManager.setAcceptThirdPartyCookies(this, true)
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT
+                            )
 
                             settings.apply {
                                 javaScriptEnabled = true
                                 domStorageEnabled = true
                                 databaseEnabled = true
-                                cacheMode = WebSettings.LOAD_DEFAULT
-                                userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+                                loadsImagesAutomatically = true
+                                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                                // Strip "; wv" so Instagram renders the mobile web login form
+                                userAgentString = userAgentString.replace("; wv", "")
                             }
 
-                            webChromeClient = object : WebChromeClient() {
-                                override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                                    isLoading = newProgress < 95
-                                }
-                            }
+                            val cookieManager = CookieManager.getInstance()
+                            cookieManager.setAcceptCookie(true)
+                            cookieManager.setAcceptThirdPartyCookies(this, true)
 
                             webViewClient = object : WebViewClient() {
-                                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                                    super.onPageStarted(view, url, favicon)
-                                    isLoading = true
-                                    checkCookies(url)
+                                override fun shouldOverrideUrlLoading(
+                                    view: WebView?,
+                                    request: WebResourceRequest?
+                                ): Boolean {
+                                    val url = request?.url?.toString() ?: return false
+                                    // Block intent:// and instagram:// redirects that cause blank screens
+                                    return !(url.startsWith("http://") || url.startsWith("https://"))
+                                }
+
+                                override fun onPageStarted(
+                                    view: WebView?,
+                                    url: String?,
+                                    favicon: Bitmap?
+                                ) {
+                                    isLoadingPage = true
+                                    statusText = "Loading secure Instagram login..."
                                 }
 
                                 override fun onPageFinished(view: WebView?, url: String?) {
-                                    super.onPageFinished(view, url)
-                                    isLoading = false
-                                    checkCookies(url)
-                                }
+                                    isLoadingPage = false
+                                    statusText = "Sign in with your Instagram account"
+                                    cookieManager.flush()
 
-                                private fun checkCookies(url: String?) {
-                                    val cookies = cookieManager.getCookie(url ?: "https://www.instagram.com/") ?: return
-                                    var dsUserId: String? = null
-                                    var csrfToken: String? = null
+                                    val cookies = cookieManager.getCookie("https://www.instagram.com") ?: ""
+                                    val dsUserId = extractCookieValue(cookies, "ds_user_id")
+                                    val csrfToken = extractCookieValue(cookies, "csrftoken")
+                                    val sessionId = extractCookieValue(cookies, "sessionid")
 
-                                    cookies.split(";").forEach { rawCookie ->
-                                        val trimmed = rawCookie.trim()
-                                        if (trimmed.startsWith("ds_user_id=")) {
-                                            dsUserId = trimmed.substringAfter("ds_user_id=")
-                                        } else if (trimmed.startsWith("csrftoken=")) {
-                                            csrfToken = trimmed.substringAfter("csrftoken=")
-                                        }
-                                    }
-
-                                    if (!dsUserId.isNullOrEmpty() && !csrfToken.isNullOrEmpty()) {
-                                        statusText = "Authenticated successfully!"
-                                        onLoginSuccess(dsUserId!!, csrfToken!!)
+                                    if (!hasCompletedLogin && !dsUserId.isNullOrBlank() && !csrfToken.isNullOrBlank() && !sessionId.isNullOrBlank()) {
+                                        hasCompletedLogin = true
+                                        statusText = "Connected! Syncing your graph..."
+                                        onLoginSuccess(cookies, dsUserId, csrfToken)
                                     }
                                 }
                             }
@@ -166,4 +158,10 @@ fun InstagramLoginDialog(
     }
 }
 
-private val Color_0x14White = androidx.compose.ui.graphics.Color(0x14FFFFFF)
+private fun extractCookieValue(cookieHeader: String, key: String): String? {
+    return cookieHeader.split(";")
+        .map { it.trim() }
+        .firstOrNull { it.startsWith("$key=") }
+        ?.substringAfter("$key=")
+        ?.trim()
+}

@@ -3,11 +3,29 @@ package com.instapulse.data.local
 import android.content.Context
 import android.content.SharedPreferences
 import com.instapulse.data.model.IGUser
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
 class InstaPulsePreferences(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("instapulse_prefs", Context.MODE_PRIVATE)
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private var saveFollowingJob: Job? = null
+    private var saveFollowersJob: Job? = null
+    private var saveRecentJob: Job? = null
+
+    // Fast in-memory cache for zero-lag access
+    @Volatile private var cachedFollowers: List<IGUser>? = null
+    @Volatile private var cachedFollowing: List<IGUser>? = null
+    @Volatile private var cachedRecent: List<IGUser>? = null
+    @Volatile private var cachedWhitelist: Set<String>? = null
 
     companion object {
         private const val KEY_FOLLOWERS = "key_followers_v1"
@@ -17,64 +35,158 @@ class InstaPulsePreferences(context: Context) {
         private const val KEY_ACTION_LOGS = "key_action_logs_v1"
         private const val KEY_IS_LOGGED_IN = "key_is_logged_in"
         private const val KEY_LAST_SYNC_TIME = "key_last_sync_time"
+        private const val KEY_COOKIE_HEADER = "key_cookie_header"
+        private const val KEY_DS_USER_ID = "key_ds_user_id"
+        private const val KEY_CSRF_TOKEN = "key_csrf_token"
+        private const val KEY_MY_USERNAME = "key_my_username"
+        private const val KEY_MY_AVATAR = "key_my_avatar"
+        private const val KEY_TOTAL_FOLLOWERS = "key_total_followers"
+        private const val KEY_TOTAL_FOLLOWING = "key_total_following"
     }
 
+    fun saveAuth(cookieHeader: String, dsUserId: String, csrfToken: String) {
+        prefs.edit()
+            .putString(KEY_COOKIE_HEADER, cookieHeader)
+            .putString(KEY_DS_USER_ID, dsUserId)
+            .putString(KEY_CSRF_TOKEN, csrfToken)
+            .putBoolean(KEY_IS_LOGGED_IN, true)
+            .apply()
+    }
+
+    fun saveProfileInfo(username: String, avatarUrl: String, followerCount: Int, followingCount: Int) {
+        prefs.edit()
+            .putString(KEY_MY_USERNAME, username)
+            .putString(KEY_MY_AVATAR, avatarUrl)
+            .putInt(KEY_TOTAL_FOLLOWERS, followerCount)
+            .putInt(KEY_TOTAL_FOLLOWING, followingCount)
+            .apply()
+    }
+
+    fun getMyUsername(): String = prefs.getString(KEY_MY_USERNAME, "") ?: ""
+    fun getMyAvatar(): String = prefs.getString(KEY_MY_AVATAR, "") ?: ""
+    fun getExpectedFollowersCount(): Int = prefs.getInt(KEY_TOTAL_FOLLOWERS, 0)
+    fun getExpectedFollowingCount(): Int = prefs.getInt(KEY_TOTAL_FOLLOWING, 0)
+
+    fun getCookieHeader(): String? = prefs.getString(KEY_COOKIE_HEADER, null)
+    fun getDsUserId(): String? = prefs.getString(KEY_DS_USER_ID, null)
+    fun getCsrfToken(): String? = prefs.getString(KEY_CSRF_TOKEN, null)
+
     fun saveFollowers(users: List<IGUser>) {
-        prefs.edit().putString(KEY_FOLLOWERS, serializeUsers(users)).apply()
+        cachedFollowers = users
+        saveFollowersJob?.cancel()
+        saveFollowersJob = scope.launch(Dispatchers.IO) {
+            delay(500) // 500ms debounce
+            val serialized = serializeUsers(users)
+            prefs.edit().putString(KEY_FOLLOWERS, serialized).apply()
+        }
+    }
+
+    suspend fun saveFollowersImmediate(users: List<IGUser>) = withContext(Dispatchers.IO) {
+        cachedFollowers = users
+        saveFollowersJob?.cancel()
+        val serialized = serializeUsers(users)
+        prefs.edit().putString(KEY_FOLLOWERS, serialized).apply()
     }
 
     fun getFollowers(): List<IGUser> {
+        cachedFollowers?.let { return it }
         val raw = prefs.getString(KEY_FOLLOWERS, null) ?: return emptyList()
-        return deserializeUsers(raw)
+        val parsed = deserializeUsers(raw)
+        cachedFollowers = parsed
+        return parsed
+    }
+
+    suspend fun getFollowersSuspending(): List<IGUser> = withContext(Dispatchers.IO) {
+        getFollowers()
     }
 
     fun saveFollowing(users: List<IGUser>) {
-        prefs.edit().putString(KEY_FOLLOWING, serializeUsers(users)).apply()
+        cachedFollowing = users
+        saveFollowingJob?.cancel()
+        saveFollowingJob = scope.launch(Dispatchers.IO) {
+            delay(500) // 500ms debounce
+            val serialized = serializeUsers(users)
+            prefs.edit().putString(KEY_FOLLOWING, serialized).apply()
+        }
+    }
+
+    suspend fun saveFollowingImmediate(users: List<IGUser>) = withContext(Dispatchers.IO) {
+        cachedFollowing = users
+        saveFollowingJob?.cancel()
+        val serialized = serializeUsers(users)
+        prefs.edit().putString(KEY_FOLLOWING, serialized).apply()
     }
 
     fun getFollowing(): List<IGUser> {
+        cachedFollowing?.let { return it }
         val raw = prefs.getString(KEY_FOLLOWING, null) ?: return emptyList()
-        return deserializeUsers(raw)
+        val parsed = deserializeUsers(raw)
+        cachedFollowing = parsed
+        return parsed
+    }
+
+    suspend fun getFollowingSuspending(): List<IGUser> = withContext(Dispatchers.IO) {
+        getFollowing()
     }
 
     fun saveRecentActivity(users: List<IGUser>) {
-        prefs.edit().putString(KEY_RECENT, serializeUsers(users)).apply()
+        cachedRecent = users
+        saveRecentJob?.cancel()
+        saveRecentJob = scope.launch(Dispatchers.IO) {
+            delay(500)
+            val serialized = serializeUsers(users)
+            prefs.edit().putString(KEY_RECENT, serialized).apply()
+        }
     }
 
     fun getRecentActivity(): List<IGUser> {
+        cachedRecent?.let { return it }
         val raw = prefs.getString(KEY_RECENT, null) ?: return emptyList()
-        return deserializeUsers(raw)
+        val parsed = deserializeUsers(raw)
+        cachedRecent = parsed
+        return parsed
     }
 
     fun saveWhitelist(pks: Set<String>) {
-        val arr = JSONArray()
-        pks.forEach { arr.put(it) }
-        prefs.edit().putString(KEY_WHITELIST, arr.toString()).apply()
+        cachedWhitelist = pks
+        scope.launch(Dispatchers.IO) {
+            val arr = JSONArray()
+            pks.forEach { arr.put(it) }
+            prefs.edit().putString(KEY_WHITELIST, arr.toString()).apply()
+        }
     }
 
     fun getWhitelist(): Set<String> {
+        cachedWhitelist?.let { return it }
         val raw = prefs.getString(KEY_WHITELIST, null) ?: return emptySet()
         val set = mutableSetOf<String>()
-        val arr = JSONArray(raw)
-        for (i in 0 until arr.length()) {
-            set.add(arr.getString(i))
-        }
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                set.add(arr.getString(i))
+            }
+        } catch (_: Exception) { }
+        cachedWhitelist = set
         return set
     }
 
     fun saveActionTimestamps(logs: List<Long>) {
-        val arr = JSONArray()
-        logs.forEach { arr.put(it) }
-        prefs.edit().putString(KEY_ACTION_LOGS, arr.toString()).apply()
+        scope.launch(Dispatchers.IO) {
+            val arr = JSONArray()
+            logs.forEach { arr.put(it) }
+            prefs.edit().putString(KEY_ACTION_LOGS, arr.toString()).apply()
+        }
     }
 
     fun getActionTimestamps(): List<Long> {
         val raw = prefs.getString(KEY_ACTION_LOGS, null) ?: return emptyList()
         val list = mutableListOf<Long>()
-        val arr = JSONArray(raw)
-        for (i in 0 until arr.length()) {
-            list.add(arr.getLong(i))
-        }
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                list.add(arr.getLong(i))
+            }
+        } catch (_: Exception) { }
         return list
     }
 
@@ -91,6 +203,10 @@ class InstaPulsePreferences(context: Context) {
     fun getLastSyncTime(): Long = prefs.getLong(KEY_LAST_SYNC_TIME, 0L)
 
     fun clearAll() {
+        cachedFollowers = null
+        cachedFollowing = null
+        cachedRecent = null
+        cachedWhitelist = null
         prefs.edit().clear().apply()
     }
 
@@ -168,10 +284,18 @@ class InstaPulsePreferences(context: Context) {
             IGUser("2007", "sunset_captures", "Golden Hour Daily", "", isVerified = false, isPrivate = false)
         )
 
-        saveFollowing(sampleFollowing)
-        saveFollowers(sampleFollowers)
-        saveWhitelist(setOf("1006"))
-        setLastSyncTime(System.currentTimeMillis() - 180000)
+        cachedFollowing = sampleFollowing
+        cachedFollowers = sampleFollowers
+        cachedWhitelist = setOf("1006")
+
+        scope.launch(Dispatchers.IO) {
+            prefs.edit()
+                .putString(KEY_FOLLOWING, serializeUsers(sampleFollowing))
+                .putString(KEY_FOLLOWERS, serializeUsers(sampleFollowers))
+                .putString(KEY_WHITELIST, JSONArray().put("1006").toString())
+                .putLong(KEY_LAST_SYNC_TIME, System.currentTimeMillis() - 180000)
+                .apply()
+        }
         return Pair(sampleFollowers, sampleFollowing)
     }
 }

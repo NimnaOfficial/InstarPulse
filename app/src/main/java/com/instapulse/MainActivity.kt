@@ -5,6 +5,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -67,7 +68,9 @@ fun MainApp(viewModel: InstaPulseViewModel) {
 
             // Floating HUD for Action Queue Execution
             Box(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .navigationBarsPadding(),
                 contentAlignment = Alignment.BottomCenter
             ) {
                 InstaActionExecutorHud(
@@ -86,7 +89,9 @@ fun MainApp(viewModel: InstaPulseViewModel) {
             InstagramLoginDialog(
                 visible = showLoginModal,
                 onDismiss = viewModel::closeLoginModal,
-                onLoginSuccess = viewModel::onLoginSuccess
+                onLoginSuccess = { cookieHeader, dsUserId, csrfToken ->
+                    viewModel.onLoginSuccess(cookieHeader, dsUserId, csrfToken)
+                }
             )
         }
     }
