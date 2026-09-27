@@ -27,6 +27,9 @@ const STORAGE_KEYS = {
   ACTION_LOG: '@instapulse_action_log_v1',
 };
 
+// ============================================================================
+// INJECTED BRIDGE: Sequential pagination with retry & truncation guard
+// ============================================================================
 const INJECTED_IG_BRIDGE = `
 (function() {
   if (window.__INSTAPULSE_BRIDGE_ACTIVE) return;
@@ -58,27 +61,53 @@ const INJECTED_IG_BRIDGE = `
     let allUsers = [];
     let nextMaxId = '';
     let hasNext = true;
+    let consecutiveFailures = 0;
 
     while (hasNext) {
-      const url = 'https://www.instagram.com/api/v1/friendships/' + userId + '/' + edgeType + '/?count=100' + (nextMaxId ? '&max_id=' + encodeURIComponent(nextMaxId) : '');
-      const res = await fetch(url, {
-        method: 'GET',
-        credentials: 'include',
-        headers: {
-          'x-ig-app-id': IG_APP_ID,
-          'x-csrftoken': getCookie('csrftoken') || '',
-          'x-requested-with': 'XMLHttpRequest'
-        }
-      });
+      const url = 'https://www.instagram.com/api/v1/friendships/' + userId + '/' + edgeType + '/?count=50' + (nextMaxId ? '&max_id=' + encodeURIComponent(nextMaxId) : '');
+      
+      let res = null;
+      let data = null;
+      let success = false;
 
-      if (!res.ok) {
-        throw new Error('Instagram HTTP ' + res.status + ' while fetching ' + edgeType);
+      // 3-attempt retry with exponential backoff
+      const backoffs = [1500, 3000, 5000];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          res = await fetch(url, {
+            method: 'GET',
+            credentials: 'include',
+            headers: {
+              'x-ig-app-id': IG_APP_ID,
+              'x-csrftoken': getCookie('csrftoken') || '',
+              'x-requested-with': 'XMLHttpRequest'
+            }
+          });
+
+          if (res.ok) {
+            data = await res.json();
+            success = true;
+            consecutiveFailures = 0;
+            break;
+          } else {
+            // Non-200 response — retry after backoff
+            if (attempt < 2) await sleep(backoffs[attempt]);
+          }
+        } catch (err) {
+          // Network error — retry after backoff
+          if (attempt < 2) await sleep(backoffs[attempt]);
+        }
       }
 
-      const data = await res.json();
+      if (!success) {
+        consecutiveFailures++;
+        // If we've already fetched some users, throw to prevent returning a truncated list
+        throw new Error('Instagram HTTP error while fetching ' + edgeType + ' (page failed after 3 retries, fetched ' + allUsers.length + ' so far)');
+      }
+
       const batch = (data.users || []).map(u => ({
         pk: String(u.pk || u.id),
-        username: String(u.username || '').toLowerCase(),
+        username: String(u.username || '').toLowerCase().trim(),
         fullName: String(u.full_name || ''),
         profilePicUrl: String(u.profile_pic_url || ''),
         isVerified: Boolean(u.is_verified),
@@ -95,12 +124,24 @@ const INJECTED_IG_BRIDGE = `
 
       if (data.next_max_id && data.big_list !== false) {
         nextMaxId = data.next_max_id;
-        await sleep(350 + Math.random() * 300);
+        // 600ms - 900ms delay between pages for stability
+        await sleep(600 + Math.random() * 300);
       } else {
         hasNext = false;
       }
     }
-    return allUsers;
+
+    // Deduplicate by pk before returning
+    const seen = new Set();
+    const deduped = [];
+    for (let i = 0; i < allUsers.length; i++) {
+      const key = allUsers[i].pk;
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduped.push(allUsers[i]);
+      }
+    }
+    return deduped;
   }
 
   window.runRealInstagramSync = async function() {
@@ -110,10 +151,11 @@ const INJECTED_IG_BRIDGE = `
         window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'AUTH_REQUIRED' }));
         return;
       }
-      const [followers, following] = await Promise.all([
-        fetchGraphEdge(myId, 'followers'),
-        fetchGraphEdge(myId, 'following')
-      ]);
+
+      // SEQUENTIAL: fetch followers first, then following
+      // This prevents Instagram from throttling parallel requests
+      const followers = await fetchGraphEdge(myId, 'followers');
+      const following = await fetchGraphEdge(myId, 'following');
 
       window.ReactNativeWebView.postMessage(JSON.stringify({
         type: 'SYNC_SUCCESS',
@@ -151,6 +193,9 @@ export default function App() {
   const [actionQueue, setActionQueue] = useState<ActionQueueItem[]>([]);
   const [executorMode, setExecutorMode] = useState<'ASSIST' | 'AUTO_QUEUE'>('AUTO_QUEUE');
   const [busyPk, setBusyPk] = useState<string | null>(null);
+
+  // Track whether we're in a batch operation (to suppress error alerts)
+  const isBatchRef = useRef(false);
 
   // Load from AsyncStorage
   useEffect(() => {
@@ -193,10 +238,31 @@ export default function App() {
         }));
       } else if (msg.type === 'SYNC_SUCCESS') {
         setIsSyncing(false);
-                setFollowers(msg.followers);
-        setFollowing(msg.following);
-        await AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWERS, JSON.stringify(msg.followers));
-        await AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(msg.following));
+
+        // TRUNCATION GUARD: Only overwrite cached lists if the new lists are
+        // at least 80% the size of the old ones (prevents truncated sync from
+        // destroying a good cached list)
+        const newFollowers: IGUser[] = msg.followers;
+        const newFollowing: IGUser[] = msg.following;
+
+        setFollowers(prev => {
+          if (prev.length > 0 && newFollowers.length < prev.length * 0.8) {
+            console.warn('[InstaPulse] Truncation guard: new followers list too small, keeping cached');
+            return prev;
+          }
+          AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWERS, JSON.stringify(newFollowers));
+          return newFollowers;
+        });
+
+        setFollowing(prev => {
+          if (prev.length > 0 && newFollowing.length < prev.length * 0.8) {
+            console.warn('[InstaPulse] Truncation guard: new following list too small, keeping cached');
+            return prev;
+          }
+          AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(newFollowing));
+          return newFollowing;
+        });
+
       } else if (msg.type === 'SYNC_ERROR') {
         setIsSyncing(false);
         Alert.alert('Sync Alert', msg.message);
@@ -235,6 +301,7 @@ export default function App() {
 
   const handleStartBatchQueue = useCallback((queue: ActionQueueItem[]) => {
     if (queue.length === 0) return;
+    isBatchRef.current = queue.length > 1;
     setActionQueue(queue);
     setExecutorVisible(true);
   }, []);
@@ -250,10 +317,60 @@ export default function App() {
   }, []);
 
   const handleInspectProfile = useCallback((username: string) => {
+    isBatchRef.current = false;
     setActionQueue([{ username, action: 'FOLLOW' }]);
     setExecutorMode('ASSIST');
     setExecutorVisible(true);
   }, []);
+
+  const handleActionComplete = useCallback((item: ActionQueueItem, status?: 'SUCCESS' | 'SKIPPED_UNAVAILABLE' | 'ERROR') => {
+    if (status === 'ERROR') {
+      // During batch processing, suppress Alert popup — just log silently
+      // The HUD already shows the error message
+      if (!isBatchRef.current) {
+        Alert.alert('Action Failed', `Could not ${item.action.toLowerCase()} @${item.username}.`);
+      }
+      return;
+    }
+
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    const updatedLogs = [...actionTimestamps, Date.now()];
+    setActionTimestamps(updatedLogs);
+    AsyncStorage.setItem(STORAGE_KEYS.ACTION_LOG, JSON.stringify(updatedLogs));
+
+    let actionType: 'unfollowed' | 'followed' | 'skipped_unavailable' = item.action === 'UNFOLLOW' ? 'unfollowed' : 'followed';
+    if (status === 'SKIPPED_UNAVAILABLE') {
+      actionType = 'skipped_unavailable';
+    }
+
+    const actionTarget = followers.find(u => u.pk === item.pk || u.username === item.username) 
+      || following.find(u => u.pk === item.pk || u.username === item.username) 
+      || { pk: item.pk || '', username: item.username, fullName: item.username, profilePicUrl: '', isVerified: false, isPrivate: false };
+    
+    const recentUser = { ...actionTarget, lastAction: actionType, actionTimestamp: Date.now() };
+
+    setRecentActivity(prev => {
+      const next = [recentUser, ...prev.filter(u => u.pk !== item.pk && u.username !== item.username)];
+      AsyncStorage.setItem(STORAGE_KEYS.RECENT_ACTIVITY, JSON.stringify(next));
+      return next;
+    });
+
+    // State transitions matched by BOTH pk and username
+    if (item.action === 'UNFOLLOW' || status === 'SKIPPED_UNAVAILABLE') {
+      setFollowing(prev => {
+        const next = prev.filter(u => u.pk !== item.pk && u.username !== item.username);
+        AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(next));
+        return next;
+      });
+    } else if (item.action === 'FOLLOW') {
+      setFollowing(prev => {
+        const exists = prev.some(u => u.pk === item.pk || u.username === item.username);
+        const next = exists ? prev : [recentUser, ...prev];
+        AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(next));
+        return next;
+      });
+    }
+  }, [followers, following, actionTimestamps]);
 
   return (
     <SafeAreaProvider>
@@ -301,57 +418,16 @@ export default function App() {
             setExecutorVisible(false);
             setExecutorMode('AUTO_QUEUE');
             setBusyPk(null);
+            isBatchRef.current = false;
           }}
           onActionStart={(pk) => {
             setBusyPk(pk);
           }}
-          onActionComplete={(item, status) => {
-            if (status === 'ERROR') {
-              Alert.alert('Action Failed', `Could not ${item.action.toLowerCase()} @${item.username}. Instagram may have rejected it or the button wasn't found.`);
-              return;
-            }
-
-            LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-            const updatedLogs = [...actionTimestamps, Date.now()];
-            setActionTimestamps(updatedLogs);
-            AsyncStorage.setItem(STORAGE_KEYS.ACTION_LOG, JSON.stringify(updatedLogs));
-
-            let actionType: 'unfollowed' | 'followed' | 'skipped_unavailable' = item.action === 'UNFOLLOW' ? 'unfollowed' : 'followed';
-            if (status === 'SKIPPED_UNAVAILABLE') {
-              actionType = 'skipped_unavailable';
-            }
-
-            const actionTarget = followers.find(u => u.pk === item.pk || u.username === item.username) 
-              || following.find(u => u.pk === item.pk || u.username === item.username) 
-              || { pk: item.pk || '', username: item.username, fullName: item.username, profilePicUrl: '', isVerified: false, isPrivate: false };
-            
-            const recentUser = { ...actionTarget, lastAction: actionType, actionTimestamp: Date.now() };
-
-            setRecentActivity(prev => {
-              const next = [recentUser, ...prev.filter(u => u.pk !== item.pk && u.username !== item.username)];
-              AsyncStorage.setItem(STORAGE_KEYS.RECENT_ACTIVITY, JSON.stringify(next));
-              return next;
-            });
-
-            // If skipped, we still remove them from following so they disappear from the UI
-            if (item.action === 'UNFOLLOW' || status === 'SKIPPED_UNAVAILABLE') {
-              setFollowing(prev => {
-                const next = prev.filter(u => u.pk !== item.pk && u.username !== item.username);
-                AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(next));
-                return next;
-              });
-            } else if (item.action === 'FOLLOW') {
-              setFollowing(prev => {
-                const exists = prev.some(u => u.pk === item.pk || u.username === item.username);
-                const next = exists ? prev : [recentUser, ...prev];
-                AsyncStorage.setItem(STORAGE_KEYS.LAST_FOLLOWING, JSON.stringify(next));
-                return next;
-              });
-            }
-          }}
+          onActionComplete={handleActionComplete}
           onQueueFinished={() => {
             setExecutorVisible(false);
             setBusyPk(null);
+            isBatchRef.current = false;
           }}
         />
 
@@ -375,4 +451,3 @@ export default function App() {
     </SafeAreaProvider>
   );
 }
-

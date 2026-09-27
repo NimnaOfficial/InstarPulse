@@ -242,28 +242,58 @@ export const InstaPulseDashboard: React.FC<BridgeAdapterProps> = ({
     return { hourlyCount, dailyCount, status };
   }, [actionTimestamps]);
 
-  // Determine active dataset (Props or explicit Demo)
-  const effectiveFollowers = followers;
-  const effectiveFollowing = following;
-  const effectiveBaseline = recentActivity.length > 0 ? recentActivity : effectiveFollowers;
+  // ==========================================================================
+  // DEDUPLICATE & BUILD DUAL-KEY RELATIONSHIP SETS
+  // Dedup by pk first, then by username, to prevent stale duplicates
+  // ==========================================================================
+  const { dedupedFollowers, dedupedFollowing } = useMemo(() => {
+    function dedup(list: IGUser[]): IGUser[] {
+      const seenPk = new Set<string>();
+      const seenName = new Set<string>();
+      const result: IGUser[] = [];
+      for (const u of list) {
+        const pk = String(u.pk).trim();
+        const name = u.username.toLowerCase().trim();
+        if (seenPk.has(pk) || seenName.has(name)) continue;
+        seenPk.add(pk);
+        seenName.add(name);
+        result.push(u);
+      }
+      return result;
+    }
+    return {
+      dedupedFollowers: dedup(followers),
+      dedupedFollowing: dedup(following),
+    };
+  }, [followers, following]);
 
-  // ==========================================================================
-  // O(1) LINEAR-TIME HASH SET ENGINE
-  // ==========================================================================
   const relationships = useMemo(() => {
-    const followerSet = new Set(effectiveFollowers.map((u) => u.pk));
-    const followingSet = new Set(effectiveFollowing.map((u) => u.pk));
+    // Build DUAL-KEY sets: match by pk OR username to prevent mismatches
+    const followerPkSet = new Set(dedupedFollowers.map(u => String(u.pk).trim()));
+    const followerNameSet = new Set(dedupedFollowers.map(u => u.username.toLowerCase().trim()));
+    const followingPkSet = new Set(dedupedFollowing.map(u => String(u.pk).trim()));
+    const followingNameSet = new Set(dedupedFollowing.map(u => u.username.toLowerCase().trim()));
 
-    // a) Don't Follow Back: In following, NOT in followers, NOT in whitelist, NOT handled
-    const dontFollowBack = effectiveFollowing.filter((u: IGUser) => !followerSet.has(u.pk) && !whitelistPks.has(u.pk));
-      const fans = effectiveFollowers.filter((u: IGUser) => !followingSet.has(u.pk) && !whitelistPks.has(u.pk));
-      const mutuals = effectiveFollowing.filter((u: IGUser) => followerSet.has(u.pk) && !whitelistPks.has(u.pk));
-      const whitelisted = [
-        ...effectiveFollowing.filter((u: IGUser) => whitelistPks.has(u.pk)),
-        ...effectiveFollowers.filter((u: IGUser) => whitelistPks.has(u.pk) && !followingSet.has(u.pk))
-      ];
-      return { dontFollowBack, fans, recents: recentActivity, mutuals, whitelisted, followingSet };
-    }, [effectiveFollowers, effectiveFollowing, recentActivity, whitelistPks]);
+    const isFollowerFn = (u: IGUser) =>
+      followerPkSet.has(String(u.pk).trim()) || followerNameSet.has(u.username.toLowerCase().trim());
+    const isFollowingFn = (u: IGUser) =>
+      followingPkSet.has(String(u.pk).trim()) || followingNameSet.has(u.username.toLowerCase().trim());
+    const isWhitelistedFn = (u: IGUser) => whitelistPks.has(String(u.pk).trim());
+
+    // Combined followingSet for row-level "isFollowing" checks (used by UserCardRow)
+    const followingSet = new Set<string>();
+    dedupedFollowing.forEach(u => { followingSet.add(String(u.pk).trim()); });
+
+    const dontFollowBack = dedupedFollowing.filter(u => !isFollowerFn(u) && !isWhitelistedFn(u));
+    const fans = dedupedFollowers.filter(u => !isFollowingFn(u) && !isWhitelistedFn(u));
+    const mutuals = dedupedFollowing.filter(u => isFollowerFn(u) && !isWhitelistedFn(u));
+    const whitelisted = [
+      ...dedupedFollowing.filter(u => isWhitelistedFn(u)),
+      ...dedupedFollowers.filter(u => isWhitelistedFn(u) && !isFollowingFn(u))
+    ];
+
+    return { dontFollowBack, fans, recents: recentActivity, mutuals, whitelisted, followingSet };
+  }, [dedupedFollowers, dedupedFollowing, recentActivity, whitelistPks]);
 
   // Current tab items
   const activeTabList = useMemo(() => {
@@ -384,7 +414,7 @@ export const InstaPulseDashboard: React.FC<BridgeAdapterProps> = ({
             </View>
           </View>
           <Text maxFontSizeMultiplier={1.15} style={styles.headerSubText}>
-            {effectiveFollowers.length} Followers • {effectiveFollowing.length} Following
+            {followers.length} Followers • {following.length} Following
           </Text>
         </View>
 
@@ -431,7 +461,7 @@ export const InstaPulseDashboard: React.FC<BridgeAdapterProps> = ({
         <FlashList<IGUser>
           data={displayItems}
           keyExtractor={(item) => item.pk}
-          extraData={`${activeTab}_${effectiveFollowing.length}_${effectiveFollowers.length}_${recentActivity.length}_${whitelistPks.size}_${checkedPks.size}`}
+          extraData={`${activeTab}_${following.length}_${followers.length}_${recentActivity.length}_${whitelistPks.size}_${checkedPks.size}`}
           refreshing={isSyncing}
           onRefresh={onStartLiveSync}
           ListHeaderComponent={() => (
@@ -443,7 +473,7 @@ export const InstaPulseDashboard: React.FC<BridgeAdapterProps> = ({
                     <View style={{ backgroundColor: 'rgba(255, 59, 92, 0.15)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 }}><Text maxFontSizeMultiplier={1.15} style={{ fontSize: 10, fontWeight: 'bold', color: '#FF3B5C' }}>TRAITORS</Text></View>
                   </View>
                   <Text maxFontSizeMultiplier={1.15} style={{ fontSize: 13, color: '#94A3B8', fontWeight: '600' }}>Not Following Back</Text>
-                  <View style={{ marginTop: 8, height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2 }}><View style={{ width: `${Math.min(100, (relationships.dontFollowBack.length / Math.max(1, effectiveFollowing.length)) * 100)}%`, height: '100%', backgroundColor: '#FF3B5C', borderRadius: 2 }} /></View>
+                  <View style={{ marginTop: 8, height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2 }}><View style={{ width: `${Math.min(100, (relationships.dontFollowBack.length / Math.max(1, following.length)) * 100)}%`, height: '100%', backgroundColor: '#FF3B5C', borderRadius: 2 }} /></View>
                 </TouchableOpacity>
 
                 <TouchableOpacity style={[{ width: cardWidth, backgroundColor: '#131724', borderRadius: 18, padding: 16, borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.04)' }, activeTab === 'FANS' && { borderColor: '#10B981', backgroundColor: 'rgba(16, 185, 129, 0.05)' }]} onPress={() => setActiveTab('FANS')} activeOpacity={0.85}>
@@ -452,7 +482,7 @@ export const InstaPulseDashboard: React.FC<BridgeAdapterProps> = ({
                     <View style={{ backgroundColor: 'rgba(16, 185, 129, 0.15)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 }}><Text maxFontSizeMultiplier={1.15} style={{ fontSize: 10, fontWeight: 'bold', color: '#10B981' }}>FANS</Text></View>
                   </View>
                   <Text maxFontSizeMultiplier={1.15} style={{ fontSize: 13, color: '#94A3B8', fontWeight: '600' }}>Loyal Followers</Text>
-                  <View style={{ marginTop: 8, height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2 }}><View style={{ width: `${Math.min(100, (relationships.fans.length / Math.max(1, effectiveFollowers.length)) * 100)}%`, height: '100%', backgroundColor: '#10B981', borderRadius: 2 }} /></View>
+                  <View style={{ marginTop: 8, height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2 }}><View style={{ width: `${Math.min(100, (relationships.fans.length / Math.max(1, followers.length)) * 100)}%`, height: '100%', backgroundColor: '#10B981', borderRadius: 2 }} /></View>
                 </TouchableOpacity>
               </View>
 
@@ -472,7 +502,7 @@ export const InstaPulseDashboard: React.FC<BridgeAdapterProps> = ({
                     <View style={{ backgroundColor: 'rgba(168, 85, 247, 0.15)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 }}><Text maxFontSizeMultiplier={1.15} style={{ fontSize: 10, fontWeight: 'bold', color: '#A855F7' }}>MUTUALS</Text></View>
                   </View>
                   <Text maxFontSizeMultiplier={1.15} style={{ fontSize: 13, color: '#94A3B8', fontWeight: '600' }}>Mutual Connections</Text>
-                  <View style={{ marginTop: 8, height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2 }}><View style={{ width: `${Math.min(100, (relationships.mutuals.length / Math.max(1, effectiveFollowing.length)) * 100)}%`, height: '100%', backgroundColor: '#A855F7', borderRadius: 2 }} /></View>
+                  <View style={{ marginTop: 8, height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2 }}><View style={{ width: `${Math.min(100, (relationships.mutuals.length / Math.max(1, following.length)) * 100)}%`, height: '100%', backgroundColor: '#A855F7', borderRadius: 2 }} /></View>
                 </TouchableOpacity>
               </View>
               
