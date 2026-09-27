@@ -84,7 +84,7 @@ class InstaWebViewBridge(private val callback: InstaBridgeCallback) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
-        const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
         private val ENGINE_JS = """
             (function() {

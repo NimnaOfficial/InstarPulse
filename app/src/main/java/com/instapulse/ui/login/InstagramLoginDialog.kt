@@ -127,7 +127,7 @@ fun InstagramLoginDialog(
                                 displayZoomControls = false
                                 layoutAlgorithm = WebSettings.LayoutAlgorithm.TEXT_AUTOSIZING
                                 // Responsive Mobile User-Agent
-                                userAgentString = "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                                userAgentString = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                             }
 
                             val cookieManager = CookieManager.getInstance()
@@ -159,7 +159,19 @@ fun InstagramLoginDialog(
 
                                     // Viewport meta fix for perfect responsive fit
                                     view?.evaluateJavascript(
-                                        "(function(){ var m = document.querySelector('meta[name=viewport]'); if(!m){ m = document.createElement('meta'); m.name='viewport'; document.head.appendChild(m); } m.content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'; document.body.style.overflowX='hidden'; })();",
+                                        """
+                                        (function() {
+                                            var meta = document.querySelector('meta[name="viewport"]');
+                                            if (!meta) {
+                                                meta = document.createElement('meta');
+                                                meta.name = 'viewport';
+                                                document.head.appendChild(meta);
+                                            }
+                                            meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
+                                            document.documentElement.style.overflowX = 'hidden';
+                                            document.body.style.overflowX = 'hidden';
+                                        })();
+                                        """.trimIndent(),
                                         null
                                     )
 

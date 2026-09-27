@@ -13,7 +13,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import com.instapulse.data.bridge.HeadlessWebViewBridgeHost
+
 import com.instapulse.ui.InstaPulseViewModel
 import com.instapulse.ui.dashboard.InstaPulseDashboardScreen
 import com.instapulse.ui.login.InstagramLoginDialog
@@ -47,11 +47,7 @@ fun MainApp(viewModel: InstaPulseViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     val executorState by viewModel.executorState.collectAsState()
     val showLoginModal by viewModel.showLoginModal.collectAsState()
-
     Box(modifier = Modifier.fillMaxSize()) {
-        // Persistent Headless WebView JS Bridge (handles real TLS/session fetch calls)
-        HeadlessWebViewBridgeHost(bridge = viewModel.webViewBridge)
-
         if (showSplash) {
             CinematicSplashScreen(
                 onFinish = { viewModel.finishSplash() }
@@ -72,7 +68,11 @@ fun MainApp(viewModel: InstaPulseViewModel) {
                 onStartLiveSync = viewModel::startLiveSync,
                 onOpenLoginModal = viewModel::openLoginModal,
                 onLogout = viewModel::logout,
-                onLoadSampleData = viewModel::loadSampleData
+                onLoadSampleData = { /* Removed */ },
+                onSyncProgress = viewModel::handleSyncProgress,
+                onSyncComplete = viewModel::handleSyncComplete,
+                onSyncError = viewModel::handleSyncError,
+                onActionResult = viewModel::handleActionResult
             )
 
             // Floating HUD for Action Queue Execution
@@ -90,7 +90,8 @@ fun MainApp(viewModel: InstaPulseViewModel) {
                     countdown = executorState.countdown,
                     statusMessage = executorState.statusMessage,
                     onTogglePause = viewModel::toggleExecutorPause,
-                    onCancel = viewModel::cancelExecutor
+                    onCancel = viewModel::cancelExecutor,
+                    onActionResult = viewModel::handleActionResult
                 )
             }
 

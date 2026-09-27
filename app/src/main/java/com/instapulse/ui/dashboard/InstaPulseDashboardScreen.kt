@@ -2,6 +2,12 @@ package com.instapulse.ui.dashboard
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.viewinterop.AndroidView
+import android.webkit.WebView
+import android.webkit.CookieManager
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -108,7 +114,11 @@ fun InstaPulseDashboardScreen(
     onStartLiveSync: () -> Unit,
     onOpenLoginModal: () -> Unit,
     onLogout: () -> Unit,
-    onLoadSampleData: () -> Unit
+    onLoadSampleData: () -> Unit,
+    onSyncProgress: (String, Int) -> Unit,
+    onSyncComplete: (String) -> Unit,
+    onSyncError: (String) -> Unit,
+    onActionResult: (String, String, Boolean) -> Unit
 ) {
     val haptic = LocalHapticFeedback.current
 
@@ -133,11 +143,77 @@ fun InstaPulseDashboardScreen(
         label = "pulseAlpha"
     )
 
-    Scaffold(
-        containerColor = CanvasBg,
-        bottomBar = {
-            // Floating Glassmorphic Batch Queue Dock
-            AnimatedVisibility(
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Persistent 1dp WebView for dynamic sync
+        val webView = remember { mutableStateOf<android.webkit.WebView?>(null) }
+        
+        androidx.compose.runtime.LaunchedEffect(state.jsCommand) {
+            state.jsCommand?.let { cmd ->
+                webView.value?.evaluateJavascript(cmd, null)
+            }
+        }
+
+        AndroidView(
+            modifier = Modifier
+                .size(375.dp, 667.dp)
+                .offset(x = (-2000).dp)
+                .alpha(0.02f),
+            factory = { context ->
+                android.webkit.WebView(context).apply {
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        // DO NOT override userAgentString!
+                    }
+                    val cookieManager = android.webkit.CookieManager.getInstance()
+                    cookieManager.setAcceptCookie(true)
+                    cookieManager.setAcceptThirdPartyCookies(this, true)
+
+                    class InstaJsBridge {
+                        @android.webkit.JavascriptInterface
+                        fun postMessage(jsonString: String) {
+                            try {
+                                val json = org.json.JSONObject(jsonString)
+                                val type = json.optString("type")
+                                when (type) {
+                                    "SYNC_PROGRESS" -> {
+                                        val edgeType = json.optString("edgeType")
+                                        val count = json.optInt("count")
+                                        onSyncProgress(edgeType, count)
+                                    }
+                                    "SYNC_SUCCESS" -> {
+                                        onSyncComplete(jsonString)
+                                    }
+                                    "SYNC_ERROR" -> {
+                                        val msg = json.optString("message")
+                                        onSyncError(msg)
+                                    }
+                                    "ACTION_RESULT" -> {
+                                        val targetPk = json.optString("targetPk")
+                                        val actionType = json.optString("actionType")
+                                        val success = json.optBoolean("success")
+                                        onActionResult(targetPk, actionType, success)
+                                    }
+                                    // other types like AUTH_STATUS can be handled if needed
+                                }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                        }
+                    }
+                    addJavascriptInterface(InstaJsBridge(), "InstaNativeBridge")
+                    loadUrl("https://www.instagram.com/")
+                    webView.value = this
+                }
+            }
+        )
+
+        Scaffold(
+            containerColor = CanvasBg,
+            bottomBar = {
+                // Floating Glassmorphic Batch Queue Dock
+                AnimatedVisibility(
                 visible = state.checkedPks.isNotEmpty(),
                 enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
                 exit = slideOutVertically(targetOffsetY = { it }) + fadeOut()
@@ -856,6 +932,7 @@ fun InstaPulseDashboardScreen(
             }
         }
     }
+}
 }
 
 // Multi-Stage Animated Sync Progress Banner

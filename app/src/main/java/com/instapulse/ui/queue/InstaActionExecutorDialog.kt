@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -30,6 +31,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -51,7 +53,8 @@ fun InstaActionExecutorHud(
     countdown: Int,
     statusMessage: String,
     onTogglePause: () -> Unit,
-    onCancel: () -> Unit
+    onCancel: () -> Unit,
+    onActionResult: (String, String, Boolean) -> Unit
 ) {
     AnimatedVisibility(
         visible = visible && queue.isNotEmpty() && currentIndex < queue.size,
@@ -60,11 +63,153 @@ fun InstaActionExecutorHud(
     ) {
         val currentItem = queue.getOrNull(currentIndex) ?: return@AnimatedVisibility
 
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 20.dp)
-        ) {
+        // Offscreen 375x667 WebView for executing the 3-step action script
+        val executorWebView = androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<android.webkit.WebView?>(null) }
+        
+        // Execute the 3-step script when the current item changes or on load
+        androidx.compose.runtime.LaunchedEffect(currentItem.username, currentItem.action) {
+            val url = "https://www.instagram.com/${currentItem.username}/"
+            executorWebView.value?.loadUrl(url)
+            kotlinx.coroutines.delay(2500) // Wait for page load
+            val actionType = if (currentItem.action == ActionType.UNFOLLOW) "unfollow" else "follow"
+            val targetPk = currentItem.pk
+            val script = """
+                (async function() {
+                  const actionType = '$actionType';
+                  const targetPk = '$targetPk';
+                  const username = '${currentItem.username}';
+                  const IG_APP_ID = '936619743392459';
+                  
+                  function getCookie(name) {
+                    const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+                    return match ? decodeURIComponent(match[2]) : null;
+                  }
+                  
+                  function reportNative(success) {
+                    if(window.InstaNativeBridge) {
+                        window.InstaNativeBridge.postMessage(JSON.stringify({
+                            type: 'ACTION_RESULT',
+                            targetPk: targetPk,
+                            actionType: actionType,
+                            success: success
+                        }));
+                    }
+                  }
+
+                  // Step A: checkAlreadyInDesiredState
+                  const btnTexts = Array.from(document.querySelectorAll('button')).map(b => b.innerText.toLowerCase());
+                  const isFollowing = btnTexts.includes('following') || btnTexts.includes('requested');
+                  if (actionType === 'unfollow' && !isFollowing) {
+                      return reportNative(true);
+                  }
+                  if (actionType === 'follow' && isFollowing) {
+                      return reportNative(true);
+                  }
+                  
+                  // Step B: executeApiAction
+                  try {
+                    const endpoint = actionType === 'unfollow' 
+                        ? 'https://www.instagram.com/api/v1/friendships/destroy/' + targetPk + '/'
+                        : 'https://www.instagram.com/api/v1/friendships/create/' + targetPk + '/';
+                    
+                    const res = await fetch(endpoint, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {
+                          'content-type': 'application/x-www-form-urlencoded',
+                          'x-ig-app-id': IG_APP_ID,
+                          'x-csrftoken': getCookie('csrftoken') || '',
+                          'x-requested-with': 'XMLHttpRequest'
+                        }
+                    });
+                    const data = await res.json();
+                    if (res.ok && (data.status === 'ok' || data.friendship_status)) {
+                        return reportNative(true);
+                    }
+                  } catch (e) {
+                    console.error(e);
+                  }
+                  
+                  // Step C: executeDomFallback
+                  try {
+                      if (actionType === 'unfollow') {
+                          const followingBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.toLowerCase() === 'following' || b.innerText.toLowerCase() === 'requested');
+                          if (followingBtn) {
+                              followingBtn.click();
+                              await new Promise(r => setTimeout(r, 1000));
+                              const unfollowConfirm = Array.from(document.querySelectorAll('button')).find(b => b.innerText.toLowerCase() === 'unfollow');
+                              if (unfollowConfirm) {
+                                  unfollowConfirm.click();
+                                  return reportNative(true);
+                              }
+                          }
+                      } else {
+                          const followBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.toLowerCase() === 'follow' || b.innerText.toLowerCase() === 'follow back');
+                          if (followBtn) {
+                              followBtn.click();
+                              return reportNative(true);
+                          }
+                      }
+                  } catch (e) {
+                      console.error(e);
+                  }
+                  
+                  reportNative(false);
+                })();
+            """.trimIndent()
+            executorWebView.value?.evaluateJavascript(script, null)
+        }
+
+        Box(modifier = Modifier.fillMaxWidth()) {
+            androidx.compose.ui.viewinterop.AndroidView(
+                modifier = Modifier
+                    .size(375.dp, 667.dp)
+                    .offset(x = (-2000).dp)
+                    .alpha(0.02f),
+                factory = { context ->
+                    android.webkit.WebView(context).apply {
+                        settings.apply {
+                            javaScriptEnabled = true
+                            domStorageEnabled = true
+                            databaseEnabled = true
+                            // Default User Agent to bypass bot checks natively
+                        }
+                        val cookieManager = android.webkit.CookieManager.getInstance()
+                        cookieManager.setAcceptCookie(true)
+                        cookieManager.setAcceptThirdPartyCookies(this, true)
+                        
+                        class ActionJsBridge {
+                            @android.webkit.JavascriptInterface
+                            fun postMessage(jsonString: String) {
+                                try {
+                                    val json = org.json.JSONObject(jsonString)
+                                    val type = json.optString("type")
+                                    if (type == "ACTION_RESULT") {
+                                        val targetPk = json.optString("targetPk")
+                                        val actionType = json.optString("actionType")
+                                        val success = json.optBoolean("success")
+                                        onActionResult(targetPk, actionType, success)
+                                    }
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            }
+                        }
+                        addJavascriptInterface(ActionJsBridge(), "InstaNativeBridge")
+                    }
+                },
+                update = { webView ->
+                    if (executorWebView.value == null) {
+                        executorWebView.value = webView
+                    }
+                }
+            )
+            
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 20.dp)
+            ) {
             // Glass container
             Box(
                 modifier = Modifier
@@ -228,4 +373,5 @@ fun InstaActionExecutorHud(
             }
         }
     }
+}
 }
