@@ -159,52 +159,107 @@ export const InstaActionExecutor: React.FC<InstaActionExecutorProps> = ({
             } catch(e) { }
           }
           
-          if (targetPk && /^\\d+$/.test(String(targetPk))) {
+          if (targetPk && /^\d+$/.test(String(targetPk))) {
             var endpoint = TARGET_ACTION === 'UNFOLLOW' ? 'destroy' : 'create';
-            var res = await fetch('https://www.instagram.com/api/v1/friendships/' + endpoint + '/' + targetPk + '/', {
-              method: 'POST',
-              credentials: 'include',
-              headers: {
-                'content-type': 'application/x-www-form-urlencoded',
-                'x-csrftoken': csrftoken || '',
-                'x-ig-app-id': IG_APP_ID,
-                'x-requested-with': 'XMLHttpRequest'
+            var formBody = 'container_module=profile&user_id=' + encodeURIComponent(targetPk);
+            var wwwClaim = (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('www-claim-v2')) || '0';
+
+            var verifiedSuccess = false;
+
+            // Tier 1: REST API with Form Body and full headers
+            try {
+              var res = await fetch('https://www.instagram.com/api/v1/friendships/' + endpoint + '/' + targetPk + '/', {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                  'accept': '*/*',
+                  'content-type': 'application/x-www-form-urlencoded',
+                  'x-csrftoken': csrftoken || '',
+                  'x-ig-app-id': IG_APP_ID,
+                  'x-asbd-id': '129477',
+                  'x-ig-www-claim': wwwClaim,
+                  'x-instagram-ajax': '1012875432',
+                  'x-requested-with': 'XMLHttpRequest',
+                  'referer': 'https://www.instagram.com/' + TARGET_USER + '/'
+                },
+                body: formBody
+              });
+              
+              if (res.status === 404) {
+                 post({ type: 'ACTION_SKIPPED', reason: 'USER_NOT_FOUND', username: TARGET_USER, status: 'SKIPPED_UNAVAILABLE' });
+                 return;
               }
-            });
-            
-            if (res.status === 404) {
-               post({ type: 'ACTION_SKIPPED', reason: 'USER_NOT_FOUND', username: TARGET_USER, status: 'SKIPPED_UNAVAILABLE' });
-               return;
-            }
 
-            if (res.status === 429) {
-               post({ type: 'ACTION_RATE_LIMITED', username: TARGET_USER });
-               return;
-            }
+              if (res.status === 429) {
+                 post({ type: 'ACTION_RATE_LIMITED', username: TARGET_USER });
+                 return;
+              }
 
-            if (res.ok) {
-              var json = await res.json();
-              if (json.status === 'ok') {
-                var fs = json.friendship_status;
-                if (fs) {
-                  if (TARGET_ACTION === 'UNFOLLOW' && (fs.following === false || fs.outgoing_request === false)) {
-                     post({ type: 'ACTION_COMPLETE', action: TARGET_ACTION, username: TARGET_USER, status: 'SUCCESS' });
-                     return;
-                  }
-                  if (TARGET_ACTION === 'FOLLOW' && (fs.following === true || fs.outgoing_request === true)) {
-                     post({ type: 'ACTION_COMPLETE', action: TARGET_ACTION, username: TARGET_USER, status: 'SUCCESS' });
-                     return;
-                  }
+              if (res.ok) {
+                var json = await res.json();
+                if (json && (json.status === 'ok' || json.friendship_status)) {
+                  verifiedSuccess = true;
                 }
-                // Fallback success if friendship_status is missing but status is ok
-                post({ type: 'ACTION_COMPLETE', action: TARGET_ACTION, username: TARGET_USER, status: 'SUCCESS' });
-                return;
               }
+            } catch(e1) {}
+
+            // Tier 2: GraphQL / Polaris Mutation Fallback
+            if (!verifiedSuccess) {
+              try {
+                var gqlDocId = TARGET_ACTION === 'UNFOLLOW' ? '7301295479961089' : '7258991244196452';
+                var friendlyName = TARGET_ACTION === 'UNFOLLOW' ? 'usePolarisUnfollowMutation' : 'usePolarisFollowMutation';
+                var gqlBody = 'av=' + encodeURIComponent(getCookie('ds_user_id') || '') +
+                  '&fb_api_req_friendly_name=' + friendlyName +
+                  '&variables=' + encodeURIComponent(JSON.stringify({ target_user_id: targetPk, container_module: 'profile' })) +
+                  '&doc_id=' + gqlDocId;
+
+                var gqlRes = await fetch('https://www.instagram.com/graphql/query', {
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {
+                    'content-type': 'application/x-www-form-urlencoded',
+                    'x-ig-app-id': IG_APP_ID,
+                    'x-asbd-id': '129477',
+                    'x-csrftoken': csrftoken || '',
+                    'x-fb-friendly-name': friendlyName
+                  },
+                  body: gqlBody
+                });
+                if (gqlRes.ok) verifiedSuccess = true;
+              } catch(e2) {}
+            }
+
+            // Tier 3: Real-Time Server Truth Verification
+            try {
+              var verifyRes = await fetch('https://www.instagram.com/api/v1/friendships/show/' + targetPk + '/', {
+                method: 'GET',
+                credentials: 'include',
+                headers: {
+                  'x-ig-app-id': IG_APP_ID,
+                  'x-asbd-id': '129477',
+                  'x-csrftoken': csrftoken || '',
+                  'x-requested-with': 'XMLHttpRequest'
+                }
+              });
+
+              if (verifyRes.ok) {
+                var fs = await verifyRes.json();
+                if (TARGET_ACTION === 'UNFOLLOW' && (fs.following === false && fs.outgoing_request === false)) {
+                  verifiedSuccess = true;
+                } else if (TARGET_ACTION === 'FOLLOW' && (fs.following === true || fs.outgoing_request === true)) {
+                  verifiedSuccess = true;
+                }
+              }
+            } catch(e3) {}
+
+            if (verifiedSuccess) {
+              post({ type: 'ACTION_COMPLETE', action: TARGET_ACTION, username: TARGET_USER, status: 'SUCCESS' });
+              return;
             }
           }
           
           if (!hasPostedResult) {
-            post({ type: 'ACTION_ERROR', reason: 'API request failed', username: TARGET_USER });
+            post({ type: 'ACTION_ERROR', reason: 'Action verification failed', username: TARGET_USER });
           }
         } catch (e) {
           if (!hasPostedResult) {

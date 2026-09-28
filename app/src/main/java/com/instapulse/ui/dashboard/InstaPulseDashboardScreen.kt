@@ -119,6 +119,7 @@ fun InstaPulseDashboardScreen(
     onProfileInfo: (String, String, Int, Int) -> Unit = { _, _, _, _ -> },
     onFollowersFetched: (String) -> Unit = {},
     onFollowingFetched: (String) -> Unit = {},
+    onStreamBatch: (String, Int, String) -> Unit = { _, _, _ -> },
     onSyncComplete: (String) -> Unit,
     onSyncError: (String) -> Unit,
     onActionResult: (String, String, Boolean) -> Unit
@@ -200,6 +201,12 @@ fun InstaPulseDashboardScreen(
                                         val msg = json.optString("message")
                                         onSyncProgress("", 0, msg)
                                     }
+                                    "SYNC_STREAM_BATCH" -> {
+                                        val edgeType = json.optString("edgeType")
+                                        val totalCount = json.optInt("totalCount")
+                                        val batchUsersJson = json.optJSONArray("batchUsers")?.toString() ?: "[]"
+                                        onStreamBatch(edgeType, totalCount, batchUsersJson)
+                                    }
                                     "FOLLOWERS_FETCHED", "FOLLOWERS_LOADED" -> {
                                         onFollowersFetched(jsonString)
                                     }
@@ -214,9 +221,10 @@ fun InstaPulseDashboardScreen(
                                         onSyncError(msg)
                                     }
                                     "ACTION_RESULT" -> {
-                                        val targetPk = json.optString("targetPk")
-                                        val actionType = json.optString("actionType")
-                                        val success = json.optBoolean("success")
+                                        val targetPk = json.optString("pk").ifEmpty { json.optString("targetPk") }
+                                        val actionType = json.optString("action").ifEmpty { json.optString("actionType") }
+                                        val status = json.optString("status")
+                                        val success = json.optBoolean("success", false) || status == "SUCCESS"
                                         onActionResult(targetPk, actionType, success)
                                     }
                                 }

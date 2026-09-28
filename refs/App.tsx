@@ -387,6 +387,21 @@ export default function App() {
         }
       } else if (msg.type === 'PROFILE_INFO') {
         // Official profile totals received from Instagram
+      } else if (msg.type === 'SYNC_STREAM_BATCH') {
+        const batch = msg.batchUsers || [];
+        if (msg.edgeType === 'followers') {
+          setFollowers(prev => {
+            const pks = new Set(prev.map(u => u.pk));
+            const toAdd = batch.filter((u: any) => !pks.has(u.pk));
+            return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
+          });
+        } else if (msg.edgeType === 'following') {
+          setFollowing(prev => {
+            const pks = new Set(prev.map(u => u.pk));
+            const toAdd = batch.filter((u: any) => !pks.has(u.pk));
+            return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
+          });
+        }
       } else if (msg.type === 'SYNC_PROGRESS') {
         setSyncProgress((prev) => ({
           ...prev,

@@ -85,7 +85,7 @@ fun UserCardRow(
 ) {
     val haptic = LocalHapticFeedback.current
     val isRecents = user.lastAction != null
-    val actionTitle = if (isFollowing) "Unfollow" else "Follow Back"
+    val actionTitle = if (isFollowing) "Unfollow" else if (isRecents) "Follow" else "Follow Back"
     val actionColor = if (isFollowing) Crimson else Emerald
     val leftAccentColor = when {
         isRecents -> RecentsCyan

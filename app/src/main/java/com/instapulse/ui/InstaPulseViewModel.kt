@@ -23,6 +23,9 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import android.webkit.CookieManager
+import com.instapulse.data.bridge.InstaWebViewBridge
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 import kotlin.random.Random
 
@@ -312,214 +315,65 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
     }
     
     private fun getSyncJavascript(dsUserId: String, csrfToken: String): String {
-        return """
-            (function() {
-              if (window.__INSTAPULSE_BRIDGE_ACTIVE) return;
-              window.__INSTAPULSE_BRIDGE_ACTIVE = true;
-              window.__IS_SYNCING_LOCK = false;
+        return "${InstaWebViewBridge.ENGINE_JS}; window.runRealInstagramSync('$dsUserId', '$csrfToken');"
+    }
 
-              const IG_APP_ID = '936619743392459';
-              let lastAuthState = null;
-
-              function getCookie(name) {
-                const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
-                return match ? decodeURIComponent(match[2]) : null;
-              }
-
-              function sendMessage(payload) {
-                const str = JSON.stringify(payload);
-                if (window.InstaNativeBridge && window.InstaNativeBridge.postMessage) {
-                  window.InstaNativeBridge.postMessage(str);
-                } else if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
-                  window.ReactNativeWebView.postMessage(str);
-                } else if (window.AndroidBridge && window.AndroidBridge.postMessage) {
-                  window.AndroidBridge.postMessage(str);
+    fun handleStreamBatch(edgeType: String, totalCount: Int, batchUsersJson: String) {
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val batchArray = JSONArray(batchUsersJson)
+                val newBatch = ArrayList<IGUser>(batchArray.length())
+                for (i in 0 until batchArray.length()) {
+                    val obj = batchArray.getJSONObject(i)
+                    val pk = obj.getString("pk").trim()
+                    val username = obj.getString("username").trim().lowercase()
+                    if (pk.isNotEmpty() && username.isNotEmpty()) {
+                        newBatch.add(IGUser(
+                            pk = pk,
+                            username = username,
+                            fullName = obj.optString("fullName", ""),
+                            profilePicUrl = obj.optString("profilePicUrl", ""),
+                            isVerified = obj.optBoolean("isVerified", false),
+                            isPrivate = obj.optBoolean("isPrivate", false)
+                        ))
+                    }
                 }
-              }
 
-              const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-              // Only emit AUTH_STATUS when login state changes (prevents 2-second sync spam!)
-              function checkAuthStatus() {
-                const dsUserId = getCookie('ds_user_id');
-                const csrfToken = getCookie('csrftoken');
-                const isLoggedIn = Boolean(dsUserId && csrfToken);
-                const stateKey = isLoggedIn + '_' + (dsUserId || '');
-                if (stateKey !== lastAuthState) {
-                  lastAuthState = stateKey;
-                  sendMessage({
-                    type: 'AUTH_STATUS',
-                    isLoggedIn: isLoggedIn,
-                    dsUserId: dsUserId || null
-                  });
-                }
-              }
-
-              checkAuthStatus();
-              setInterval(checkAuthStatus, 2500);
-
-              async function fetchGraphEdgeREST(userId, edgeType, passedCsrf) {
-                const usersMap = new Map();
-                let nextMaxId = '';
-                let hasNext = true;
-                let countParam = 50; // Automatically steps down to 12 if IG rejects 50
-
-                while (hasNext) {
-                  const url = 'https://www.instagram.com/api/v1/friendships/' + userId + '/' + edgeType +
-                    '/?count=' + countParam + (nextMaxId ? '&max_id=' + encodeURIComponent(nextMaxId) : '');
-
-                  let data = null;
-                  let success = false;
-                  const backoffs = [1500, 3000, 5000, 8000];
-
-                  for (let attempt = 0; attempt < 4; attempt++) {
-                    try {
-                      const csrf = getCookie('csrftoken') || passedCsrf || '';
-                      const res = await fetch(url, {
-                        method: 'GET',
-                        credentials: 'include',
-                        headers: {
-                          'x-ig-app-id': IG_APP_ID,
-                          'x-csrftoken': csrf,
-                          'x-requested-with': 'XMLHttpRequest'
+                if (edgeType == "followers") {
+                    val existingPks = rawFollowers.map { it.pk.trim() }.toHashSet()
+                    val added = newBatch.filter { !existingPks.contains(it.pk.trim()) }
+                    if (added.isNotEmpty()) {
+                        rawFollowers = rawFollowers + added
+                        if (originalFollowersCount < rawFollowers.size) {
+                            originalFollowersCount = rawFollowers.size
                         }
-                      });
-
-                      if (res.ok) {
-                        data = await res.json();
-                        success = true;
-                        break;
-                      } else if (res.status === 400 && countParam === 50) {
-                        // If Instagram rejects count=50 on followers, immediately switch to count=12
-                        countParam = 12;
-                        await sleep(800);
-                      } else {
-                        await sleep(backoffs[attempt]);
-                      }
-                    } catch (err) {
-                      await sleep(backoffs[attempt]);
                     }
-                  }
-
-                  if (!success || !data) {
-                    // CRITICAL FIX: Do NOT throw and wipe out users already fetched!
-                    // Keep all users in usersMap and stop paginating this edge cleanly.
-                    sendMessage({
-                      type: 'STATUS',
-                      message: 'Finished ' + edgeType + ' (' + usersMap.size + ' loaded)'
-                    });
-                    break;
-                  }
-
-                  const batch = data.users || [];
-                  for (let i = 0; i < batch.length; i++) {
-                    const u = batch[i];
-                    const pk = String(u.pk || u.id || '').trim();
-                    const username = String(u.username || '').toLowerCase().trim();
-                    if (!pk || !username) continue;
-                    usersMap.set(pk, {
-                      pk: pk,
-                      username: username,
-                      fullName: String(u.full_name || ''),
-                      profilePicUrl: String(u.profile_pic_url || ''),
-                      isVerified: Boolean(u.is_verified),
-                      isPrivate: Boolean(u.is_private)
-                    });
-                  }
-
-                  sendMessage({
-                    type: 'SYNC_PROGRESS',
-                    edgeType: edgeType,
-                    count: usersMap.size,
-                    phase: 'Scanning ' + edgeType + ' (' + usersMap.size + ' accounts)...'
-                  });
-
-                  if (data.next_max_id !== null && data.next_max_id !== undefined && String(data.next_max_id) !== '' && data.big_list !== false) {
-                    nextMaxId = String(data.next_max_id);
-                    await sleep(650 + Math.random() * 350);
-                  } else {
-                    hasNext = false;
-                  }
+                    syncFollowersCount = rawFollowers.size
+                    syncPhaseTitle = "Streaming Followers"
+                    syncCounterText = "Loaded ${rawFollowers.size} followers live..."
+                    syncProgressFraction = 0.45f
+                } else if (edgeType == "following") {
+                    val existingPks = rawFollowing.map { it.pk.trim() }.toHashSet()
+                    val added = newBatch.filter { !existingPks.contains(it.pk.trim()) }
+                    if (added.isNotEmpty()) {
+                        rawFollowing = rawFollowing + added
+                        if (originalFollowingCount < rawFollowing.size) {
+                            originalFollowingCount = rawFollowing.size
+                        }
+                    }
+                    syncFollowingCount = rawFollowing.size
+                    syncPhaseTitle = "Streaming Following"
+                    syncCounterText = "Loaded ${rawFollowing.size} following live..."
+                    syncProgressFraction = 0.85f
                 }
 
-                return Array.from(usersMap.values());
-              }
-
-              window.runRealInstagramSync = async function(passedUserId, passedCsrf) {
-                if (window.__IS_SYNCING_LOCK) return;
-                window.__IS_SYNCING_LOCK = true;
-
-                try {
-                  const myId = passedUserId || getCookie('ds_user_id');
-                  const csrf = passedCsrf || getCookie('csrftoken') || '';
-                  if (!myId) {
-                    window.__IS_SYNCING_LOCK = false;
-                    sendMessage({ type: 'AUTH_REQUIRED' });
-                    return;
-                  }
-
-                  // Profile Info
-                  try {
-                    const profRes = await fetch('https://www.instagram.com/api/v1/users/' + myId + '/info/', {
-                      method: 'GET',
-                      credentials: 'include',
-                      headers: {
-                        'x-ig-app-id': IG_APP_ID,
-                        'x-csrftoken': csrf,
-                        'x-requested-with': 'XMLHttpRequest'
-                      }
-                    });
-                    if (profRes.ok) {
-                      const profData = await profRes.json();
-                      const u = profData.user || {};
-                      sendMessage({
-                        type: 'PROFILE_INFO',
-                        username: u.username || '',
-                        avatarUrl: u.profile_pic_url || '',
-                        followerCount: u.follower_count || 0,
-                        followingCount: u.following_count || 0
-                      });
-                    }
-                  } catch (eProf) {}
-
-                  // 1. Fetch Followers Separately & Send Immediately to UI
-                  sendMessage({ type: 'STATUS', message: 'Scanning Followers via REST API...' });
-                  const followers = await fetchGraphEdgeREST(myId, 'followers', csrf);
-                  sendMessage({
-                    type: 'FOLLOWERS_LOADED',
-                    followers: followers
-                  });
-
-                  // Short cooldown before scanning following
-                  await sleep(1000);
-
-                  // 2. Fetch Following Separately & Send Immediately to UI
-                  sendMessage({ type: 'STATUS', message: 'Scanning Following via REST API...' });
-                  const following = await fetchGraphEdgeREST(myId, 'following', csrf);
-                  sendMessage({
-                    type: 'FOLLOWING_LOADED',
-                    following: following
-                  });
-
-                  window.__IS_SYNCING_LOCK = false;
-                  sendMessage({
-                    type: 'SYNC_SUCCESS',
-                    followers: followers,
-                    following: following
-                  });
-                } catch (err) {
-                  window.__IS_SYNCING_LOCK = false;
-                  sendMessage({
-                    type: 'SYNC_ERROR',
-                    message: err.message || 'Sync error'
-                  });
+                withContext(Dispatchers.Main) {
+                    triggerStateCalculation()
                 }
-              };
-
-              window.runRealInstagramSync('$dsUserId', '$csrfToken');
-            })();
-            true;
-        """.trimIndent()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
     }
 
     private var syncFollowersCount = 0
@@ -757,101 +611,138 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
     
-    private var actionResultDeferred: kotlinx.coroutines.CompletableDeferred<Boolean>? = null
+    private var actionResultDeferred: CompletableDeferred<Boolean>? = null
 
-    fun handleActionResult(targetPk: String, actionType: String, success: Boolean) {
+    fun handleActionResult(targetPk: String, actionType: String, success: Boolean, status: String = "") {
         viewModelScope.launch(Dispatchers.Main) {
-            jsCommand = null
-            if (success) {
-                val action = if (actionType == "unfollow") ActionType.UNFOLLOW else ActionType.FOLLOW
-                applyActionResultInMemory(ActionQueueItem(targetPk, targetPk, action))
-            }
-            if (_executorState.value.visible && executorJob != null) {
-                _executorState.value = _executorState.value.copy(
-                    statusMessage = if (success) "✅ Success" else "❌ Failed"
-                )
-                actionResultDeferred?.complete(success)
-            } else {
-                busyPk = null
-                triggerStateCalculation()
-            }
+            val confirmed = success || status == "SUCCESS"
+            actionResultDeferred?.complete(confirmed)
         }
     }
 
-    private fun applyActionResultInMemory(item: ActionQueueItem) {
-        val u = (rawFollowers + rawFollowing).find { it.pk == item.pk }
-        val targetUser = u ?: IGUser(pk = item.pk ?: "", username = item.username)
-        val timestamp = System.currentTimeMillis()
-        val updatedUser = targetUser.copy(
-            lastAction = if (item.action == ActionType.UNFOLLOW) "unfollowed" else "followed",
-            actionTimestamp = timestamp
-        )
-        
-        val mutRecent = rawRecent.toMutableList()
-        mutRecent.removeAll { it.pk == item.pk }
-        mutRecent.add(0, updatedUser)
-        rawRecent = mutRecent
-        prefs.saveRecentActivity(mutRecent)
-
-        // Update server-truth matrix in memory & preferences
-        val resolvedPk = item.pk ?: targetUser.pk
-        val currentSt = rawFriendshipStatuses[resolvedPk]
-        val updatedSt = (currentSt ?: FriendshipStatus()).copy(
-            following = item.action == ActionType.FOLLOW
-        )
-        rawFriendshipStatuses = rawFriendshipStatuses + (resolvedPk to updatedSt)
-        prefs.saveFriendshipStatuses(rawFriendshipStatuses)
-
-        if (item.action == ActionType.UNFOLLOW) {
-            val mutFollowing = rawFollowing.toMutableList()
-            mutFollowing.removeAll { it.pk == item.pk }
-            rawFollowing = mutFollowing
-            prefs.saveFollowing(mutFollowing)
-        } else {
-            val mutFollowing = rawFollowing.toMutableList()
-            if (!mutFollowing.any { it.pk == item.pk }) {
-                mutFollowing.add(updatedUser)
+    private fun extractNativeCsrfToken(): String {
+        return try {
+            val rawCookies = CookieManager.getInstance().getCookie("https://www.instagram.com") ?: ""
+            var csrf = ""
+            rawCookies.split(";").forEach { part ->
+                val kv = part.trim().split("=", limit = 2)
+                if (kv.size == 2 && kv[0].trim() == "csrftoken") {
+                    csrf = kv[1].trim()
+                }
             }
-            rawFollowing = mutFollowing
-            prefs.saveFollowing(mutFollowing)
+            csrf.ifEmpty { prefs.getCsrfToken() ?: "" }
+        } catch (e: Exception) {
+            prefs.getCsrfToken() ?: ""
         }
     }
 
     fun startSingleAction(user: IGUser) {
         if (busyPk != null) return
-        val isFollowing = rawFollowing.any { it.pk == user.pk }
-        busyPk = user.pk
-        
+        val targetPk = user.pk.trim()
+        val targetUsername = user.username.lowercase().trim()
+
+        val isFollowing = rawFollowing.any { it.pk.trim() == targetPk || it.username.lowercase().trim() == targetUsername }
+        val action = if (isFollowing) ActionType.UNFOLLOW else ActionType.FOLLOW
+
+        busyPk = targetPk
+
+        // 0ms OPTIMISTIC REAL-TIME UI MUTATION
+        val backupFollowing = rawFollowing.toList()
+        val backupRecent = rawRecent.toList()
+        val timestamp = System.currentTimeMillis()
+
+        if (action == ActionType.UNFOLLOW) {
+            rawFollowing = rawFollowing.filter {
+                it.pk.trim() != targetPk && it.username.lowercase().trim() != targetUsername
+            }
+            val recentsItem = user.copy(lastAction = "unfollowed", actionTimestamp = timestamp)
+            rawRecent = listOf(recentsItem) + rawRecent.filter {
+                it.pk.trim() != targetPk && it.username.lowercase().trim() != targetUsername
+            }
+        } else {
+            val followedUser = user.copy(lastAction = "followed", actionTimestamp = timestamp)
+            if (!rawFollowing.any { it.pk.trim() == targetPk || it.username.lowercase().trim() == targetUsername }) {
+                rawFollowing = rawFollowing + followedUser
+            }
+            rawRecent = listOf(followedUser) + rawRecent.filter {
+                it.pk.trim() != targetPk && it.username.lowercase().trim() != targetUsername
+            }
+        }
+
+        prefs.saveFollowing(rawFollowing)
+        prefs.saveRecentActivity(rawRecent)
+        triggerStateCalculation() // 0ms UI update!
+
+        val queueItem = ActionQueueItem(pk = targetPk, username = user.username, action = action)
         _executorState.value = ExecutorUiState(
             visible = true,
-            queue = listOf(ActionQueueItem(pk = user.pk, username = user.username, action = if (isFollowing) ActionType.UNFOLLOW else ActionType.FOLLOW)),
+            queue = listOf(queueItem),
             currentIndex = 0,
             isPaused = false,
             countdown = 0,
-            statusMessage = "Initializing single action..."
+            statusMessage = "Executing ${action.name.lowercase()} for @${user.username}..."
         )
-        runExecutorLoop()
+
+        val csrfToken = extractNativeCsrfToken()
+        val taskKey = "single_${targetPk}_${System.currentTimeMillis()}"
+
+        executorJob?.cancel()
+        executorJob = viewModelScope.launch(Dispatchers.IO) {
+            actionResultDeferred = CompletableDeferred()
+
+            withContext(Dispatchers.Main) {
+                jsCommand = "${InstaWebViewBridge.ENGINE_JS}; window.executeRealtimeInstaAction('$taskKey', '$targetPk', '${user.username}', '${action.name}', '$csrfToken');"
+            }
+
+            val confirmed = withTimeoutOrNull(15000L) {
+                actionResultDeferred?.await()
+            }
+
+            withContext(Dispatchers.Main) {
+                busyPk = null
+                jsCommand = null
+                if (confirmed == true) {
+                    _executorState.value = _executorState.value.copy(
+                        statusMessage = "✓ Verified ${action.name.lowercase()} for @${user.username}"
+                    )
+                    delay(1200L)
+                    _executorState.value = _executorState.value.copy(visible = false)
+                } else {
+                    // Rollback on server error
+                    rawFollowing = backupFollowing
+                    rawRecent = backupRecent
+                    prefs.saveFollowing(rawFollowing)
+                    prefs.saveRecentActivity(rawRecent)
+                    triggerStateCalculation()
+                    _executorState.value = _executorState.value.copy(
+                        statusMessage = "❌ Action failed or rate limited. Rolled back."
+                    )
+                    delay(2500L)
+                    _executorState.value = _executorState.value.copy(visible = false)
+                }
+            }
+        }
     }
 
     fun startBatchQueueFromSelection() {
         val selectedPks = checkedPks
         if (selectedPks.isEmpty()) return
-        val allUsers = (rawFollowers + rawFollowing).associateBy { it.pk }
-        val followingSet = rawFollowing.map { it.pk }.toSet()
+        val allUsers = (rawFollowers + rawFollowing + rawRecent).distinctBy { it.pk.trim() }.associateBy { it.pk.trim() }
+        val followingSet = rawFollowing.map { it.pk.trim() }.toSet()
         val queue = selectedPks.map { pk ->
-            val u = allUsers[pk]
-            val action = if (followingSet.contains(pk)) ActionType.UNFOLLOW else ActionType.FOLLOW
-            ActionQueueItem(pk = pk, username = u?.username ?: pk, action = action)
+            val u = allUsers[pk.trim()]
+            val action = if (followingSet.contains(pk.trim())) ActionType.UNFOLLOW else ActionType.FOLLOW
+            ActionQueueItem(pk = pk.trim(), username = u?.username ?: pk.trim(), action = action)
         }
         clearChecked()
-        
+
         _executorState.value = ExecutorUiState(
             visible = true,
             queue = queue,
             currentIndex = 0,
             isPaused = false,
             countdown = 0,
-            statusMessage = "Initializing execution engine..."
+            statusMessage = "Starting batch queue (${queue.size} items)..."
         )
         runExecutorLoop()
     }
@@ -883,78 +774,74 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
                 if (_executorState.value.isPaused) break
                 val currentIndex = _executorState.value.currentIndex
                 val item = _executorState.value.queue[currentIndex]
+                val targetPk = item.pk?.trim() ?: ""
+                val targetUsername = item.username.lowercase().trim()
 
-                actionResultDeferred = kotlinx.coroutines.CompletableDeferred()
-                
-                val (_, csrfToken) = extractSessionCookies()
-                val actionTypeStr = if (item.action == ActionType.UNFOLLOW) "unfollow" else "follow"
-                val actionScript = """
-                    (async function() {
-                        const targetPk = '${item.pk}';
-                        const actionType = '$actionTypeStr';
-                        const csrf = '$csrfToken';
-                        const IG_APP_ID = '936619743392459';
-                        function getCookie(name) {
-                            const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
-                            return match ? decodeURIComponent(match[2]) : null;
-                        }
-                        const effectiveCsrf = csrf || getCookie('csrftoken') || '';
-                        try {
-                            const endpoint = actionType === 'unfollow' 
-                                ? 'https://www.instagram.com/api/v1/friendships/destroy/' + targetPk + '/'
-                                : 'https://www.instagram.com/api/v1/friendships/create/' + targetPk + '/';
-                            const res = await fetch(endpoint, {
-                                method: 'POST',
-                                credentials: 'include',
-                                headers: {
-                                    'content-type': 'application/x-www-form-urlencoded',
-                                    'x-ig-app-id': IG_APP_ID,
-                                    'x-csrftoken': effectiveCsrf,
-                                    'x-requested-with': 'XMLHttpRequest'
-                                }
-                            });
-                            const data = await res.json();
-                            const ok = res.ok && (data.status === 'ok' || Boolean(data.friendship_status));
-                            if (window.InstaNativeBridge) {
-                                window.InstaNativeBridge.postMessage(JSON.stringify({
-                                    type: 'ACTION_RESULT',
-                                    targetPk: targetPk,
-                                    actionType: actionType,
-                                    success: ok
-                                }));
-                            }
-                        } catch(e) {
-                            if (window.InstaNativeBridge) {
-                                window.InstaNativeBridge.postMessage(JSON.stringify({
-                                    type: 'ACTION_RESULT',
-                                    targetPk: targetPk,
-                                    actionType: actionType,
-                                    success: false
-                                }));
-                            }
-                        }
-                    })();
-                    true;
-                """.trimIndent()
+                actionResultDeferred = CompletableDeferred()
+
+                val backupFollowing = rawFollowing.toList()
+                val backupRecent = rawRecent.toList()
+                val timestamp = System.currentTimeMillis()
 
                 withContext(Dispatchers.Main) {
-                    busyPk = item.pk
-                    _executorState.value = _executorState.value.copy(
-                        statusMessage = "Executing ${item.action.name.lowercase()} for @${item.username}..."
-                    )
-                    jsCommand = actionScript
+                    busyPk = targetPk
+                    // 0ms Optimistic UI mutation per item in batch
+                    if (item.action == ActionType.UNFOLLOW) {
+                        rawFollowing = rawFollowing.filter {
+                            it.pk.trim() != targetPk && it.username.lowercase().trim() != targetUsername
+                        }
+                        val userObj = (backupFollowing + backupRecent + rawFollowers).firstOrNull {
+                            it.pk.trim() == targetPk || it.username.lowercase().trim() == targetUsername
+                        } ?: IGUser(pk = targetPk, username = item.username)
+                        val recentsItem = userObj.copy(lastAction = "unfollowed", actionTimestamp = timestamp)
+                        rawRecent = listOf(recentsItem) + rawRecent.filter {
+                            it.pk.trim() != targetPk && it.username.lowercase().trim() != targetUsername
+                        }
+                    } else {
+                        val userObj = (rawFollowers + backupRecent).firstOrNull {
+                            it.pk.trim() == targetPk || it.username.lowercase().trim() == targetUsername
+                        } ?: IGUser(pk = targetPk, username = item.username)
+                        val followedUser = userObj.copy(lastAction = "followed", actionTimestamp = timestamp)
+                        if (!rawFollowing.any { it.pk.trim() == targetPk || it.username.lowercase().trim() == targetUsername }) {
+                            rawFollowing = rawFollowing + followedUser
+                        }
+                        rawRecent = listOf(followedUser) + rawRecent.filter {
+                            it.pk.trim() != targetPk && it.username.lowercase().trim() != targetUsername
+                        }
+                    }
+                    prefs.saveFollowing(rawFollowing)
+                    prefs.saveRecentActivity(rawRecent)
                     triggerStateCalculation()
+
+                    _executorState.value = _executorState.value.copy(
+                        statusMessage = "Executing ${item.action.name.lowercase()} for @${item.username} (${currentIndex + 1}/${_executorState.value.queue.size})..."
+                    )
+
+                    val csrfToken = extractNativeCsrfToken()
+                    val taskKey = "batch_${targetPk}_${System.currentTimeMillis()}"
+                    jsCommand = "${InstaWebViewBridge.ENGINE_JS}; window.executeRealtimeInstaAction('$taskKey', '$targetPk', '${item.username}', '${item.action.name}', '$csrfToken');"
                 }
 
-                // 12-second Watchdog Timer to wait for WebView to finish executing action
-                val success = kotlinx.coroutines.withTimeoutOrNull(12000L) {
+                // 15-second Watchdog Timer for execution
+                val confirmed = withTimeoutOrNull(15000L) {
                     actionResultDeferred?.await()
                 }
 
-                if (success == null) {
-                    withContext(Dispatchers.Main) {
+                withContext(Dispatchers.Main) {
+                    jsCommand = null
+                    if (confirmed != true) {
+                        // Rollback this specific item
+                        rawFollowing = backupFollowing
+                        rawRecent = backupRecent
+                        prefs.saveFollowing(rawFollowing)
+                        prefs.saveRecentActivity(rawRecent)
+                        triggerStateCalculation()
                         _executorState.value = _executorState.value.copy(
-                            statusMessage = "❌ Timeout waiting for server response"
+                            statusMessage = "⚠️ @${item.username} failed — rolling back and continuing..."
+                        )
+                    } else {
+                        _executorState.value = _executorState.value.copy(
+                            statusMessage = "✓ Verified @${item.username}"
                         )
                     }
                 }
@@ -963,7 +850,7 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
 
                 val isBatch = _executorState.value.queue.size > 1
                 if (isBatch && currentIndex + 1 < _executorState.value.queue.size) {
-                    val pacingTotalMs = 2500L + Random.nextLong(1500L)
+                    val pacingTotalMs = 2000L + Random.nextLong(1500L)
                     val intervals = (pacingTotalMs / 1000L).toInt().coerceAtLeast(2)
                     for (sec in intervals downTo 1) {
                         if (_executorState.value.isPaused) break
@@ -976,13 +863,17 @@ class InstaPulseViewModel(application: Application) : AndroidViewModel(applicati
                         _executorState.value = _executorState.value.copy(countdown = 0)
                     }
                 }
-                
+
                 if (_executorState.value.isPaused) break
 
                 withContext(Dispatchers.Main) {
                     if (currentIndex + 1 < _executorState.value.queue.size) {
                         _executorState.value = _executorState.value.copy(currentIndex = currentIndex + 1)
                     } else {
+                        _executorState.value = _executorState.value.copy(
+                            statusMessage = "🎉 Batch queue completed successfully!"
+                        )
+                        delay(1200L)
                         _executorState.value = _executorState.value.copy(visible = false)
                         busyPk = null
                         triggerStateCalculation()

@@ -73,6 +73,7 @@ fun MainApp(viewModel: InstaPulseViewModel) {
                 onProfileInfo = viewModel::handleProfileInfo,
                 onFollowersFetched = viewModel::handleFollowersFetched,
                 onFollowingFetched = viewModel::handleFollowingFetched,
+                onStreamBatch = viewModel::handleStreamBatch,
                 onSyncComplete = viewModel::handleSyncComplete,
                 onSyncError = viewModel::handleSyncError,
                 onActionResult = viewModel::handleActionResult
